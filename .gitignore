@@ -1,0 +1,24 @@
+# ── Large data / volumes (keep local; GitHub rejects >100 MB files) ──────────
+*.trk
+*.nii
+*.nii.gz
+
+# ── C++ build output ─────────────────────────────────────────────────────────
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# ── Local Claude Code config (per-machine permission allowlist) ──────────────
+.claude/
+
+# ── OS / editor cruft ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

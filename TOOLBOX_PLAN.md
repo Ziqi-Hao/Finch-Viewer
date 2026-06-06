@@ -1,0 +1,212 @@
+# Tractography Visualization Toolbox Plan
+
+## Core Principle
+
+The editor should keep one stable interaction model while allowing the compute
+backend to improve over time:
+
+- Rendering should stay on GPU through VTK/OpenGL vertex buffers.
+- Selection/statistics should use contiguous SoA data first, then switchable
+  CPU/OpenMP, CUDA, or VTK-m backends.
+- Editing state should always be exact on the full streamline set; display
+  sampling is only a visualization policy.
+- File saving should preserve source `.trk` metadata and point data whenever
+  possible.
+- Code quality is part of performance: clean module boundaries make it possible
+  to replace CPU kernels with GPU kernels without rewriting the whole app.
+
+## Engineering Rules
+
+- Core data and compute modules should not depend on VTK.
+- Render modules should not own editing semantics.
+- Interaction modules should mutate state through explicit commands.
+- GPU/CPU backend choices should sit behind small interfaces, not leak through
+  the UI.
+- Avoid large all-knowing classes; split as soon as a module has multiple
+  responsibilities.
+- Keep the C++ implementation readable enough to compare against the Python
+  reference behavior feature by feature.
+
+## Current Python Reference
+
+`local_editor.py` already has the behavior we want the C++ toolbox to match:
+
+- full-set `alive_full` editing
+- SoA point cloud: `ALL_X`, `ALL_Y`, `ALL_Z`, `ALL_SID`, `OFFSETS`
+- deterministic display cap and point decimation
+- affine-correct FA slices
+- box preview, statistics, runtime `.trk` loading
+- CPU/GPU/FPS overlay
+
+## C++ Modules
+
+### app
+
+Entry point, CLI, application startup.
+
+Current files:
+
+- `local_editor.cpp`
+- `cpp/args.*`
+
+### data
+
+Data models shared by CPU and GPU backends.
+
+Current files:
+
+- `cpp/tractogram_store.*`
+- `cpp/bounds.hpp`
+
+Responsibilities:
+
+- Own raw `.trk` streamlines for lossless save.
+- Own SoA RASMM buffers: `x`, `y`, `z`, `sid`, `offsets`.
+- Own derived arrays: point counts, streamline lengths, later FA-per-point.
+- Expose GPU-ready buffer views without UI dependencies.
+
+### io
+
+File loading and saving.
+
+Current files:
+
+- `cpp/trk_io.*`
+
+Next:
+
+- Move `.trk` load directly into `TractogramStore`.
+- Add NIfTI volume wrapper if VTK image loading is not enough for statistics.
+- Add edit-session save/load, e.g. JSON operation log.
+
+### compute
+
+Pure algorithms independent of VTK UI.
+
+Current files:
+
+- `cpp/streamline_ops.*`
+- `cpp/selection_backend.*`
+- `cpp/statistics.*`
+
+Backend plan:
+
+- `CpuSelectionBackend`: SoA scan, OpenMP, optional per-streamline AABB prefilter.
+- `CudaSelectionBackend`: one thread per point, atomic OR into streamline flags.
+- `VtkmSelectionBackend`: portable GPU/CPU option if we want less CUDA lock-in.
+
+Algorithm order:
+
+1. SoA full point scan: fastest to implement, memory-bandwidth limited, exact.
+2. Per-streamline AABB prefilter: skip most streamlines for small boxes.
+3. Spatial grid/BVH: useful if preview becomes live during box drag.
+4. CUDA kernel: useful when point count is very large or preview is continuous.
+
+### render
+
+VTK scene and drawable geometry.
+
+Current location:
+
+- mostly `cpp/editor_app.*`
+
+Target split:
+
+- `render/vtk_scene.*`
+- `render/vtk_streamlines.*`
+- `render/vtk_fa_slices.*`
+- `render/overlays.*`
+
+GPU priorities:
+
+- Keep streamline geometry in VTK `vtkPolyData`/OpenGL buffers.
+- Avoid rebuilding all geometry for small visibility changes where possible.
+- Rebuild sampled display geometry only when alive mask or display cap changes.
+- Later: use cell visibility arrays, mapper selection, or multiple actors for
+  faster hide/show.
+
+### interaction
+
+Editing state and commands.
+
+Current location:
+
+- mostly `cpp/editor_app.*`
+
+Target split:
+
+- `interaction/edit_session.*`
+- `interaction/commands.*`
+- `interaction/keymap.*`
+
+Rules:
+
+- `aliveFull` is authoritative.
+- Undo stores masks or compressed deltas.
+- Display is always derived from `aliveFull`.
+
+### diagnostics
+
+Performance measurement and correctness checks.
+
+Target split:
+
+- `diagnostics/perf_monitor.*`
+- `bench/rebuild_display_bench.*`
+- `tests/trk_roundtrip.*`
+- `tests/selection_equivalence.*`
+
+Metrics to show:
+
+- OpenGL renderer
+- FPS
+- CPU utilization
+- GPU utilization and memory when available
+- point count, shown streamline count, full alive count
+
+## Milestones
+
+1. Data foundation
+   - C++ `TractogramStore` with SoA buffers.
+   - Full-set `aliveFull` editing.
+   - Build stays green.
+
+2. Python feature parity
+   - display cap resamples surviving streamlines
+   - `--disp-step`
+   - `p` preview
+   - `t` statistics
+   - `+/-/n` density controls
+   - runtime load
+
+3. Render performance
+   - decimated display cache
+   - avoid full VTK actor rebuilds when only visibility changes
+   - benchmark display rebuild time
+
+4. Compute backends
+   - `ISelectionBackend`
+   - CPU/OpenMP backend
+   - CUDA prototype backend
+   - backend selection CLI flag
+
+5. GPU-first interactive preview
+   - optional live box preview
+   - GPU point scan or spatial index
+   - latency and throughput logging
+
+## Near-Term Next Step
+
+Display policy parity is implemented:
+
+- `--disp-step`
+- rebuild display from surviving full-set streamlines
+- deterministic resample after every edit
+- status shows `alive`, `shown`, display cap, and display step
+- `+/-/n` runtime density controls
+- `p` preview via `SelectionBackend`
+- `t` basic statistics for surviving full-set streamlines
+
+Next feature-parity step:
+
+- FA-per-point sampling and FA-on-tract statistics
