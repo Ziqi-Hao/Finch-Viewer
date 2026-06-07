@@ -1,4 +1,4 @@
-"""FA background volume: NIfTI data + affine + world-point sampling.  No VTK.
+"""Background scalar volume: NIfTI data + affine + world-point sampling.  No VTK.
 
 Slice *geometry* for the backdrop is built in the render layer (it needs VTK);
 this module is pure data so it can be reused by stats and any compute backend.
@@ -9,7 +9,7 @@ import numpy as np
 import nibabel as nib
 
 
-class FaVolume:
+class Volume:
     def __init__(self, img):
         self.img = img
         self.arr = img.get_fdata().astype(np.float32)
@@ -23,8 +23,8 @@ class FaVolume:
         return cls(nib.load(path))
 
     def sample(self, X, Y, Z):
-        """FA at each world point (X,Y,Z); NaN outside the volume.  Vectorized
-        over the SoA axes -- no (T,3) temporary, no per-streamline loop."""
+        """Volume value at each world point (X,Y,Z); NaN outside the volume.
+        Vectorized over the SoA axes -- no (T,3) temporary, no per-streamline loop."""
         m = self.inv_aff
         vx = np.round(m[0, 0] * X + m[0, 1] * Y + m[0, 2] * Z + m[0, 3]).astype(np.int64)
         vy = np.round(m[1, 0] * X + m[1, 1] * Y + m[1, 2] * Z + m[1, 3]).astype(np.int64)

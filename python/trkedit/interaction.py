@@ -44,7 +44,7 @@ def setup_interaction(editor):
     bindings = {
         "d": editor.delete_in_box, "k": editor.keep_only_in_box,
         "u": editor.undo, "r": editor.reset, "s": editor.save,
-        "h": editor.toggle_fa, "t": editor.print_stats, "p": editor.preview_box,
+        "h": editor.toggle_volume, "t": editor.print_stats, "p": editor.preview_box,
         "l": editor.load_dialog, "n": editor.density_set, "q": editor.quit,
     }
     for key, fn in bindings.items():

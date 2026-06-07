@@ -9,12 +9,13 @@ namespace tracto {
 void Usage(const char* exe) {
   std::cout
       << "Usage:\n"
-      << "  " << exe << " --fa FA.nii.gz --trk input.trk --out edited.trk\n\n"
+      << "  " << exe << " --volume vol.nii.gz --trk input.trk --out edited.trk\n\n"
       << "Options:\n"
+      << "  --volume P      background scalar volume (NIfTI; any modality). Alias: --fa\n"
       << "  --display-n N   streamlines drawn interactively, default 12000\n"
       << "  --disp-step N   draw every N-th point per streamline, default 2\n"
       << "  --seed N        deterministic display subsampling seed, default 0\n"
-      << "  --no-fa         start without FA slices, useful for display debugging\n"
+      << "  --no-volume     start without volume slices, useful for display debugging\n"
       << "  --front-buffer  draw directly to the front buffer for display debugging\n"
       << "  --gdi-blit      display OpenGL frames through Win32 GDI fallback\n"
       << "  --screenshot P  render one frame to PNG and exit\n"
@@ -32,8 +33,8 @@ Args ParseArgs(int argc, char** argv) {
       return argv[++i];
     };
 
-    if (key == "--fa") {
-      args.faPath = requireValue(key);
+    if (key == "--volume" || key == "--fa") {  // --fa: deprecated alias
+      args.volumePath = requireValue(key);
     } else if (key == "--trk") {
       args.trkPath = requireValue(key);
     } else if (key == "--out") {
@@ -44,8 +45,8 @@ Args ParseArgs(int argc, char** argv) {
       args.dispStep = std::stoi(requireValue(key));
     } else if (key == "--seed") {
       args.seed = static_cast<uint64_t>(std::stoull(requireValue(key)));
-    } else if (key == "--no-fa") {
-      args.noFa = true;
+    } else if (key == "--no-volume" || key == "--no-fa") {
+      args.noVolume = true;
     } else if (key == "--front-buffer") {
       args.frontBuffer = true;
     } else if (key == "--gdi-blit") {
@@ -60,9 +61,9 @@ Args ParseArgs(int argc, char** argv) {
     }
   }
 
-  if ((!args.noFa && args.faPath.empty()) || args.trkPath.empty() || args.outPath.empty()) {
+  if ((!args.noVolume && args.volumePath.empty()) || args.trkPath.empty() || args.outPath.empty()) {
     Usage(argv[0]);
-    throw std::runtime_error("missing required --fa, --trk, or --out");
+    throw std::runtime_error("missing required --volume, --trk, or --out");
   }
   if (args.displayN <= 0) {
     throw std::runtime_error("--display-n must be positive");

@@ -4,6 +4,37 @@ Use the scripts in `tools/` as the stable command surface. This avoids PATH
 drift between PowerShell sessions and keeps Codex from repeatedly hand-writing
 fragile commands.
 
+## macOS (Homebrew) — Qt/OpenGL editor
+
+The primary C++ editor on macOS is `local_editor_qt`, a pure **Qt + OpenGL**
+app (no VTK). One-time toolchain install:
+
+```bash
+brew install cmake ninja vtk   # vtk pulls in qtbase (Qt6) used by the Qt editor
+```
+
+Build and run via the mac scripts:
+
+```bash
+./tools/build_mac.sh                  # configure (Ninja) + build all default targets
+./tools/build_mac.sh local_editor_qt  # build just the Qt editor
+./tools/run_qt_editor.sh --trk in.trk --fa FA.nii.gz   # every flag optional; File menu also loads
+```
+
+Default targets on macOS are `local_editor_qt`, `local_editor_glfw`, and
+`glfw_probe`. The legacy VTK editor (`local_editor_cpp`) is **off by default**
+— Homebrew's VTK 9.6 dropped the `<vtk_glew.h>` header `editor_app.cpp` relies
+on. Re-enable it (e.g. on Windows/vcpkg) with `-DBUILD_VTK_EDITOR=ON`.
+
+The FA volume (`.nii.gz`) must be in the **same space** as the tractogram, or
+its slices land off-screen; the editor warns when their bounds don't overlap.
+`--screenshot out.png` renders one frame headless and exits (used for verifying).
+
+Controls: left-drag rotate · right/middle-drag pan · wheel zoom · `R` reset ·
+`H` toggle FA slices.
+
+The PowerShell sections below are the Windows/vcpkg workflow.
+
 ## Environment Check
 
 ```powershell

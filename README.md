@@ -14,8 +14,8 @@ The repo holds two implementations, kept intentionally separate:
   up** to the Python reference (work in progress). Build/run notes:
   [DEV_WORKFLOW.md](DEV_WORKFLOW.md).
 
-Shared `.trk` / `.nii.gz` data lives at the repo root (not tracked — too large
-for GitHub) and is passed to either editor via the CLI.
+Shared `.trk` / `.nii.gz` data lives in `data/` (not tracked — too large for
+GitHub) and is passed to either editor via the CLI.
 
 ---
 

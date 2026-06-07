@@ -2,8 +2,8 @@
 
 Every point of every streamline lives in three contiguous per-axis arrays
 (X/Y/Z) plus a per-point streamline id (sid); per-streamline (m,3) arrays are
-reconstructed on demand via `offsets`.  This SoA layout makes selection and FA
-sampling single vectorized passes (see CLAUDE.md: optimize from the data layout
+reconstructed on demand via `offsets`.  This SoA layout makes selection and
+volume sampling single vectorized passes (see CLAUDE.md: optimize from the data layout
 outward) and lets editing/saving stay exact on the full set.
 """
 from __future__ import annotations

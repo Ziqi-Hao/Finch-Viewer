@@ -1,4 +1,4 @@
-"""Rendering layer (PyVista/VTK): FA backdrop, the streamline line layer, HUD.
+"""Rendering layer (PyVista/VTK): volume backdrop, the streamline line layer, HUD.
 
 This is the only place streamline data meets VTK.  Performance notes that live
 here on purpose (see CLAUDE.md, comment the *why*):
@@ -53,20 +53,20 @@ def direction_rgb(streamline):
     return np.abs(d / nrm).astype(np.float32)
 
 
-def make_fa_slices(fa):
-    """Three orthogonal FA slices, placed in true world space.
+def make_volume_slices(vals):
+    """Three orthogonal volume slices, placed in true world space.
 
     Build the grid in voxel-index space, slice it, then push each slice through
     the real affine -- a naive origin+spacing grid would drop the affine's x
     flip and place the backdrop ~120 mm off the tracts.
     """
-    grid = pv.ImageData(dimensions=np.array(fa.shape) + 1,
+    grid = pv.ImageData(dimensions=np.array(vals.shape) + 1,
                         spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0))
-    grid.cell_data["FA"] = fa.arr.flatten(order="F")
-    mid = [s // 2 for s in fa.shape]
-    sx = grid.slice(normal="x", origin=(mid[0], 0, 0)).transform(fa.affine, inplace=False)
-    sy = grid.slice(normal="y", origin=(0, mid[1], 0)).transform(fa.affine, inplace=False)
-    sz = grid.slice(normal="z", origin=(0, 0, mid[2])).transform(fa.affine, inplace=False)
+    grid.cell_data["Volume"] = vals.arr.flatten(order="F")
+    mid = [s // 2 for s in vals.shape]
+    sx = grid.slice(normal="x", origin=(mid[0], 0, 0)).transform(vals.affine, inplace=False)
+    sy = grid.slice(normal="y", origin=(0, mid[1], 0)).transform(vals.affine, inplace=False)
+    sz = grid.slice(normal="z", origin=(0, 0, mid[2])).transform(vals.affine, inplace=False)
     return [sx, sy, sz]
 
 

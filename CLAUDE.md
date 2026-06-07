@@ -9,11 +9,16 @@ iteration surface; C++ is catching up to match it):
   `editor`). Run from the `trkedit` conda env (Ubuntu-22.04 WSL):
   `python python/local_editor.py --fa FA.nii.gz --trk in.trk --out out.trk`
   (`scilpy_env`'s VTK is a headless EGL-only build and cannot open a window).
-- `local_editor.cpp` + `cpp/` + `CMakeLists.txt` + `tools/` (repo root) — the C++
-  toolbox port, built/run via the `tools/` scripts (see [DEV_WORKFLOW.md](DEV_WORKFLOW.md)).
+- `cpp/` + `CMakeLists.txt` + `tools/` — the C++ toolbox port. All C++ lives
+  under `cpp/`: `cpp/core/` is the shared, UI-free io/data/compute library
+  (`tracto_core`); the apps are `cpp/qt/` (the primary Qt + OpenGL editor),
+  `cpp/glfw/`, and the opt-in legacy `cpp/vtk/`. Each app folder holds its
+  `main.cpp` next to its own code. Build/run via the `tools/` scripts
+  (`tools/build_mac.sh` on macOS; see [DEV_WORKFLOW.md](DEV_WORKFLOW.md)).
 
-Shared `.trk`/`.nii.gz` data lives at the repo root so both can reference it.
-Keep the two trees from leaking into each other.
+Shared `.trk`/`.nii.gz` data lives in `data/` (gitignored) so both
+implementations can reference it via the CLI. Keep the two trees from leaking
+into each other, and keep `cpp/core/` free of VTK and Qt.
 
 The detailed engineering rules already live in **[DEV_WORKFLOW.md](DEV_WORKFLOW.md)**
 ("Code Quality Rules") and **[TOOLBOX_PLAN.md](TOOLBOX_PLAN.md)** ("Engineering

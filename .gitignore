@@ -1,4 +1,5 @@
 # ── Large data / volumes (keep local; GitHub rejects >100 MB files) ──────────
+# Shared .trk/.nii(.gz) live in data/; ignored anywhere by extension.
 *.trk
 *.nii
 *.nii.gz
@@ -19,6 +20,9 @@ __pycache__/
 
 # ── Local Claude Code config (per-machine permission allowlist) ──────────────
 .claude/
+
+# ── External Claude Code skills/plugins repo cloned in-tree (own .git) ───────
+agent-skills/
 
 # ── Debug / scratch screenshots ──────────────────────────────────────────────
 debug_*

@@ -40,6 +40,12 @@ backend to improve over time:
 
 ## C++ Modules
 
+> Layout note: the tree is organized as `cpp/core/` (the `tracto_core` library:
+> io/data/compute) plus one folder per app — `cpp/qt/`, `cpp/glfw/`, `cpp/vtk/`,
+> each with its own `main.cpp`. The per-module file paths below predate that move
+> (e.g. `cpp/trk_io.*` is now `cpp/core/trk_io.*`, `cpp/editor_app.*` is
+> `cpp/vtk/editor_app.*`); the module responsibilities still hold.
+
 ### app
 
 Entry point, CLI, application startup.

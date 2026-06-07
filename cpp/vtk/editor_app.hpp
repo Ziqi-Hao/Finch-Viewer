@@ -56,7 +56,7 @@ class EditorApp {
 
  private:
   void RebuildDisplayPolyData(bool render = false);
-  void BuildFaActors();
+  void BuildVolumeActors();
   void AddReferenceGeometry();
   void RefreshLines(bool render = true);
   void UpdateStatus();
@@ -64,7 +64,7 @@ class EditorApp {
   void KeepOnlyInBox();
   void Undo();
   void Reset();
-  void ToggleFa();
+  void ToggleVolume();
   void PreviewBox();
   void PrintStats();
   void RecenterCamera();
@@ -92,7 +92,7 @@ class EditorApp {
   std::vector<Snapshot> history_;
 
   bool dirty_ = false;
-  bool showFa_ = true;
+  bool showVolume_ = true;
   bool hasBox_ = false;
   int displayCap_ = 12000;
   int startupFramesRemaining_ = 0;
@@ -112,7 +112,7 @@ class EditorApp {
   vtkSmartPointer<vtkRenderWindowInteractor> interactor_;
   vtkSmartPointer<vtkTextActor> statusActor_;
   vtkSmartPointer<vtkBoxWidget> boxWidget_;
-  std::vector<vtkSmartPointer<vtkImageActor>> faActors_;
+  std::vector<vtkSmartPointer<vtkImageActor>> volumeActors_;
 };
 
 }  // namespace tracto

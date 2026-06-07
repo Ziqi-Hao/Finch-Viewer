@@ -287,11 +287,11 @@ void EditorApp::RebuildDisplayPolyData(bool render) {
   }
 }
 
-void EditorApp::BuildFaActors() {
-  std::cout << "Loading FA   : " << args_.faPath << "\n";
+void EditorApp::BuildVolumeActors() {
+  std::cout << "Loading volume   : " << args_.volumePath << "\n";
 
   vtkSmartPointer<vtkNIFTIImageReader> reader = vtkSmartPointer<vtkNIFTIImageReader>::New();
-  reader->SetFileName(args_.faPath.c_str());
+  reader->SetFileName(args_.volumePath.c_str());
   reader->Update();
 
   vtkImageData* image = reader->GetOutput();
@@ -359,7 +359,7 @@ void EditorApp::BuildFaActors() {
     actor->GetProperty()->SetOpacity(1.0);
     actor->GetProperty()->SetInterpolationTypeToNearest();
     renderer_->AddActor(actor);
-    faActors_.push_back(actor);
+    volumeActors_.push_back(actor);
   };
 
   addSlice(midX, midX, extent[2], extent[3], extent[4], extent[5]);
@@ -397,11 +397,11 @@ void EditorApp::Run() {
       vtkSmartPointer<vtkInteractorStyleTrackballCamera>::New();
   interactor_->SetInteractorStyle(style);
 
-  if (args_.noFa) {
-    showFa_ = false;
-    std::cout << "Skipping FA slices (--no-fa)\n";
+  if (args_.noVolume) {
+    showVolume_ = false;
+    std::cout << "Skipping volume slices (--no-fa)\n";
   } else {
-    BuildFaActors();
+    BuildVolumeActors();
   }
 
   lineMapper_ = vtkSmartPointer<vtkPolyDataMapper>::New();
@@ -650,7 +650,7 @@ void EditorApp::OnKey(const std::string& key) {
     } else if (key == "s") {
       Save();
     } else if (key == "h") {
-      ToggleFa();
+      ToggleVolume();
     } else if (key == "p") {
       PreviewBox();
     } else if (key == "t") {
@@ -790,14 +790,14 @@ void EditorApp::Reset() {
   RebuildDisplayPolyData(true);
 }
 
-void EditorApp::ToggleFa() {
-  if (faActors_.empty()) {
-    std::cout << "no FA actors loaded\n";
+void EditorApp::ToggleVolume() {
+  if (volumeActors_.empty()) {
+    std::cout << "no volume actors loaded\n";
     return;
   }
-  showFa_ = !showFa_;
-  for (auto& actor : faActors_) {
-    actor->SetVisibility(showFa_ ? 1 : 0);
+  showVolume_ = !showVolume_;
+  for (auto& actor : volumeActors_) {
+    actor->SetVisibility(showVolume_ ? 1 : 0);
   }
   PresentFrame();
 }
@@ -1016,7 +1016,7 @@ void EditorApp::UpdateStatus() {
      << "   cap: " << FormatCount(static_cast<std::size_t>(displayCap_))
      << "   step: " << args_.dispStep << "\n"
      << "d=delete in box  k=keep only in box  u=undo  r=reset  "
-     << "s=save  h=toggle FA  p=preview  t=stats  c=recenter  +/-=density  n=set density  q=quit";
+     << "s=save  h=toggle volume  p=preview  t=stats  c=recenter  +/-=density  n=set density  q=quit";
   statusActor_->SetInput(ss.str().c_str());
 }
 

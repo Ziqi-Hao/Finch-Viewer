@@ -5,7 +5,7 @@ The implementation lives in the `trkedit` package; the project rules live in
 ../CLAUDE.md.  Run from the `trkedit` conda env (Ubuntu-22.04 WSL):
 
     python python/local_editor.py \
-        --fa  SUBG08_tissue_FA_aggressive.nii.gz \
+        --volume SUBG08_tissue_FA_aggressive.nii.gz \
         --trk SUBG08_OR_full.trk \
         --out SUBG08_OR_edited.trk
 
@@ -13,7 +13,7 @@ The implementation lives in the `trkedit` package; the project rules live in
 
 Controls: drag the yellow box (white = inside box -> will be edited); then
 d=delete  k=keep  p=preview  t=stats  +/-=density  n=set#  l=load  u=undo
-r=reset  s=save  h=toggle FA  q=quit.  Rotate the view by dragging the empty
+r=reset  s=save  h=toggle volume  q=quit.  Rotate the view by dragging the empty
 background.
 """
 import argparse
@@ -28,7 +28,8 @@ from trkedit.editor import Editor
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--fa", required=True, help="background FA NIfTI")
+    p.add_argument("--volume", "--fa", dest="volume", required=True,
+                   help="background scalar volume NIfTI (--fa is a deprecated alias)")
     p.add_argument("--trk", default=None,
                    help="input .trk (optional; a file dialog opens if omitted)")
     p.add_argument("--out", required=True, help="output .trk for surviving subset")

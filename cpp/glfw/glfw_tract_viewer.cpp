@@ -469,9 +469,12 @@ void GlfwTractViewer::ResetCamera() {
 }
 
 void GlfwTractViewer::RotateCamera(double dx, double dy) {
-  yaw_ += static_cast<float>(dx) * 0.006f;
-  pitch_ += static_cast<float>(dy) * 0.006f;
-  pitch_ = std::clamp(pitch_, -1.35f, 1.35f);
+  // Grab-style, matching OrbitCamera::Rotate. No pitch clamp (full 360°); invert
+  // the yaw delta when the view is upside-down (cos pitch < 0) so left/right
+  // stays consistent past the poles.
+  const float yawSign = std::cos(pitch_) < 0.0f ? 1.0f : -1.0f;
+  yaw_ += yawSign * static_cast<float>(dx) * 0.006f;
+  pitch_ -= static_cast<float>(dy) * 0.006f;
 }
 
 void GlfwTractViewer::ZoomCamera(double delta) {
@@ -480,10 +483,10 @@ void GlfwTractViewer::ZoomCamera(double delta) {
 }
 
 void GlfwTractViewer::PanCamera(double dx, double dy) {
-  const float cp = std::cos(pitch_);
-  const Vec3 forward{std::sin(yaw_) * cp, -std::cos(yaw_) * cp, std::sin(pitch_)};
-  const Vec3 right = Normalize(Cross(forward, {0.0f, 0.0f, 1.0f}));
-  const Vec3 up = Normalize(Cross(right, forward));
+  // Screen right/up derived from yaw/pitch (valid past ±90°); matches OrbitCamera.
+  const float sp = std::sin(pitch_);
+  const Vec3 right{-std::cos(yaw_), -std::sin(yaw_), 0.0f};
+  const Vec3 up{-sp * std::sin(yaw_), sp * std::cos(yaw_), std::cos(pitch_)};
   const float scale = 0.0018f * distance_;
   const Vec3 delta = right * static_cast<float>(-dx * scale) + up * static_cast<float>(dy * scale);
   target_[0] += delta.x;
@@ -495,10 +498,13 @@ void GlfwTractViewer::DrawFrame(int width, int height) {
   const float aspect = std::max(1.0f, static_cast<float>(width)) /
                        std::max(1.0f, static_cast<float>(height));
   const float cp = std::cos(pitch_);
-  const Vec3 forward{std::sin(yaw_) * cp, -std::cos(yaw_) * cp, std::sin(pitch_)};
+  const float sp = std::sin(pitch_);
+  const Vec3 forward{std::sin(yaw_) * cp, -std::cos(yaw_) * cp, sp};
   const Vec3 center{target_[0], target_[1], target_[2]};
   const Vec3 eye = center - forward * distance_;
-  const Mat4 view = LookAt(eye, center, {0.0f, 0.0f, 1.0f});
+  // Pitch-aware up so rotation can pass over the poles (matches OrbitCamera::Up).
+  const Vec3 up{-sp * std::sin(yaw_), sp * std::cos(yaw_), cp};
+  const Mat4 view = LookAt(eye, center, up);
   const Mat4 proj = Perspective(50.0f * kPi / 180.0f, aspect, radius_ * 0.01f, radius_ * 80.0f);
   const Mat4 mvp = Multiply(proj, view);
 

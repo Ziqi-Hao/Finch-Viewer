@@ -1,0 +1,36 @@
+#pragma once
+
+// VTK-free NIfTI-1 reader for the scalar background volume. This replaces the
+// vtkNIFTIImageReader path the VTK editor used: it returns the voxels as float
+// plus the voxel->RAS affine (sform, else qform, else pixdim scaling), so the
+// Qt renderer can place orthogonal slices in the same RAS mm space as the
+// streamlines. io module: no VTK, no Qt — only zlib for .nii.gz.
+
+#include "render_math.hpp"  // Mat4 (row-major affine)
+
+#include <cstddef>
+#include <string>
+#include <vector>
+
+namespace tracto {
+
+struct Volume {
+  int dims[3] = {0, 0, 0};      // nx, ny, nz
+  std::vector<float> data;      // nx*ny*nz, x fastest (i + nx*(j + ny*k))
+  Mat4 voxelToWorld;            // voxel (i,j,k) -> RAS mm (row-major)
+  float valueMin = 0.0f;
+  float valueMax = 1.0f;
+
+  bool Empty() const { return data.empty(); }
+  std::size_t VoxelCount() const { return data.size(); }
+};
+
+// Read a NIfTI-1 ".nii" / ".nii.gz" volume. Throws std::runtime_error on a
+// malformed file or an unsupported variant (NIfTI-2, .hdr/.img pairs).
+Volume LoadNifti(const std::string& path);
+
+// World-space (RAS mm) axis-aligned bounds of the volume's voxel grid, i.e. the
+// 8 corners of [0..nx-1]x[0..ny-1]x[0..nz-1] under voxelToWorld.
+Bounds WorldBounds(const Volume& volume);
+
+}  // namespace tracto

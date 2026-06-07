@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bounds.hpp"
 #include "trk_io.hpp"
 
 #include <cstddef>
@@ -28,5 +29,9 @@ struct TractogramStore {
 };
 
 void BuildSoA(TractogramStore& store);
+
+// RAS-mm axis-aligned bounds over all points (from the SoA x/y/z arrays).
+// Returns a unit box when the store has no points.
+Bounds RasBounds(const TractogramStore& store);
 
 }  // namespace tracto

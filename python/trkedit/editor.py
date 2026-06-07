@@ -14,7 +14,7 @@ import numpy as np
 import pyvista as pv
 
 from .tractogram import Tractogram
-from .fa import FaVolume
+from .volume import Volume
 from .selection import make_selector
 from . import render as R
 from . import interaction as I
@@ -27,7 +27,7 @@ HISTORY_MAX = 100
 class Editor:
     def __init__(self, args):
         self.args = args
-        self.fa = None
+        self.volume = None
         self.tg = None
         self.selector = None
         self.plotter = None
@@ -40,15 +40,15 @@ class Editor:
         self.alive = None
         self.history = []
         self.dirty = False
-        self.show_fa = True
+        self.show_volume = True
         self.display_n = int(args.display_n)
         self.n_shown = 0
-        self._fa_pp = None        # lazy per-point FA cache (stats only)
+        self._volume_pp = None    # lazy per-point volume cache (stats only)
         self._last_hl = 0.0
 
     # ── data ────────────────────────────────────────────────────────────────
     def _load_tractogram(self, path):
-        tg = Tractogram.load(path, self.fa.img)
+        tg = Tractogram.load(path, self.volume.img)
         if tg is None:
             print("  !! no streamlines in that file -- keeping current set")
             return False
@@ -57,7 +57,7 @@ class Editor:
         self.alive = np.ones(tg.n, dtype=bool)
         self.history = []
         self.dirty = False
-        self._fa_pp = None
+        self._volume_pp = None
         print(f"  {tg.n:,} streamlines, {tg.total_pts:,} points "
               f"(selector: {self.args.selector})")
         return True
@@ -142,10 +142,10 @@ class Editor:
         self._push(); self.alive[:] = True; self.dirty = False
         print("reset"); self._refresh()
 
-    def toggle_fa(self):
-        self.show_fa = not self.show_fa
+    def toggle_volume(self):
+        self.show_volume = not self.show_volume
         for a in self.bg_actors:
-            a.SetVisibility(self.show_fa)
+            a.SetVisibility(self.show_volume)
         self.plotter.render()
 
     # ── display density ───────────────────────────────────────────────────────
@@ -193,29 +193,29 @@ class Editor:
         self._rebuild(reset_camera=True)
         print(f"loaded {os.path.basename(path)}")
 
-    def load_fa(self):
-        """Load a different FA/image volume and rebuild the slice backdrop."""
-        path = I.ask_open_file("Open FA / image (NIfTI)",
+    def load_volume(self):
+        """Load a different scalar volume and rebuild the slice backdrop."""
+        path = I.ask_open_file("Open volume (NIfTI)",
                                [("NIfTI", "*.nii*"), ("All files", "*.*")])
         if not path:
             print("load cancelled"); return
-        print(f"Loading FA   : {path}")
-        self.fa = FaVolume.load(path)
-        self._fa_pp = None                      # stats FA cache is stale now
+        print(f"Loading volume: {path}")
+        self.volume = Volume.load(path)
+        self._volume_pp = None                  # stats volume cache is stale now
         for a in self.bg_actors:
             self.plotter.remove_actor(a)
-        self.bg_actors = [self._add_fa_slice(s) for s in R.make_fa_slices(self.fa)]
+        self.bg_actors = [self._add_volume_slice(s) for s in R.make_volume_slices(self.volume)]
         for a in self.bg_actors:
-            a.SetVisibility(self.show_fa)
+            a.SetVisibility(self.show_volume)
         self.plotter.render()
-        print(f"  shape={self.fa.shape}  loaded FA {os.path.basename(path)}")
+        print(f"  shape={self.volume.shape}  loaded volume {os.path.basename(path)}")
 
     def save(self):
         keep = int(self.alive.sum())
         if keep == 0:
             print("nothing alive to save"); return
         print(f"saving {keep:,}/{self.tg.n:,} surviving streamlines -> {self.args.out} ...")
-        self.tg.save(self.args.out, self.alive, self.fa.img)
+        self.tg.save(self.args.out, self.alive, self.volume.img)
         self.dirty = False
         print(f"saved -> {self.args.out}")
 
@@ -233,10 +233,10 @@ class Editor:
         print(f"box holds {n:,} alive streamlines ({100*n/alive:.1f}% of alive)  "
               f"-> 'd' deletes them, 'k' keeps only them")
 
-    def _fa_pool(self):
-        if self._fa_pp is None:                            # sample whole cloud once
-            self._fa_pp = self.fa.sample(self.tg.X, self.tg.Y, self.tg.Z)
-        vals = self._fa_pp[self.alive[self.tg.sid]]
+    def _volume_pool(self):
+        if self._volume_pp is None:                        # sample whole cloud once
+            self._volume_pp = self.volume.sample(self.tg.X, self.tg.Y, self.tg.Z)
+        vals = self._volume_pp[self.alive[self.tg.sid]]
         return vals[~np.isnan(vals)]
 
     def print_stats(self):
@@ -244,7 +244,7 @@ class Editor:
         na = len(idx); nd = self.tg.n - na
         if na == 0:
             print("no alive streamlines"); return
-        L = self.tg.arclen[idx]; npts = self.tg.lengths[idx]; fa = self._fa_pool()
+        L = self.tg.arclen[idx]; npts = self.tg.lengths[idx]; vals = self._volume_pool()
         print("\n──────── STATISTICS  (surviving full set) ────────")
         print(f"  streamlines : alive {na:,}/{self.tg.n:,}   "
               f"deleted {nd:,} ({100*nd/self.tg.n:.1f}%)")
@@ -252,9 +252,9 @@ class Editor:
               f"sd {L.std():5.1f}  min {L.min():5.1f}  max {L.max():6.1f}")
         print(f"  points/line : mean {npts.mean():6.1f}  min {int(npts.min())}  "
               f"max {int(npts.max())}")
-        if fa.size:
-            print(f"  FA on tract : mean {fa.mean():.3f}  median {np.median(fa):.3f}  "
-                  f"sd {fa.std():.3f}")
+        if vals.size:
+            print(f"  Volume on tract : mean {vals.mean():.3f}  median {np.median(vals):.3f}  "
+                  f"sd {vals.std():.3f}")
         if self.box_bounds is not None:
             nb = int((self.selector.in_box(self.box_bounds) & self.alive).sum())
             print(f"  in curr box : {nb:,} alive streamlines")
@@ -264,9 +264,9 @@ class Editor:
     # ── build / run ─────────────────────────────────────────────────────────
     def build(self):
         """Load data and assemble the scene + widgets (everything but show())."""
-        print(f"Loading FA   : {self.args.fa}")
-        self.fa = FaVolume.load(self.args.fa)
-        print(f"  shape={self.fa.shape}  voxel={self.fa.zooms}")
+        print(f"Loading volume: {self.args.volume}")
+        self.volume = Volume.load(self.args.volume)
+        print(f"  shape={self.volume.shape}  voxel={self.volume.zooms}")
         path = self.args.trk or I.ask_open_file()
         if not path:
             sys.exit("no tractogram loaded")
@@ -276,7 +276,7 @@ class Editor:
 
         self.plotter = pv.Plotter(window_size=(1280, 900))
         self.plotter.set_background(R.BG_BOTTOM, top=R.BG_TOP)
-        self.bg_actors = [self._add_fa_slice(s) for s in R.make_fa_slices(self.fa)]
+        self.bg_actors = [self._add_volume_slice(s) for s in R.make_volume_slices(self.volume)]
         self.status = R.CornerText(self.plotter, position=(18, 44), color=R.TEXT,
                                    font_size=10, font_file=R.MONO_FONT_FILE)
         self.line = R.LineLayer(self.plotter, self.tg,
@@ -284,7 +284,7 @@ class Editor:
         I.setup_interaction(self)
         ui.setup_menu(self)
         self._rebuild(reset_camera=True)
-        self._frame_on_tracts()                    # focus on the bundle, not the FA planes
+        self._frame_on_tracts()                    # focus on the bundle, not the volume planes
         self.perf = PerfOverlay(self.plotter); self.perf.start()
         self._add_chrome()
         try:
@@ -296,16 +296,16 @@ class Editor:
         self.build()
         print("\nLaunching viewer ...")
         print("Hint: position the gold box (white = selected), then 'd' or 'k'.")
-        print("Use the on-screen buttons (top-left) to load tracts / FA or save.")
+        print("Use the on-screen buttons (top-left) to load tracts / volume or save.")
         self.plotter.show(title="Finch-Viewer")
 
-    def _add_fa_slice(self, mesh):
+    def _add_volume_slice(self, mesh):
         return self.plotter.add_mesh(mesh, cmap="gray", opacity=0.45,
                                      show_scalar_bar=False, lighting=False,
                                      reset_camera=False)
 
     def _frame_on_tracts(self):
-        """Zoom the camera to the streamlines (the FA planes extend well past them)."""
+        """Zoom the camera to the streamlines (the volume planes extend well past them)."""
         if self.line.pd is not None:
             try:
                 self.plotter.reset_camera(bounds=self.line.pd.bounds)
@@ -320,6 +320,6 @@ class Editor:
         p.add_text("tractography editor", position=(22, 842), color=R.TEXT_DIM,
                    font_size=8, font_file=R.FONT_FILE)
         p.add_text("d delete   k keep   p preview   t stats   +/- density   n set#   "
-                   "l load   u undo   r reset   s save   h FA   q quit",
+                   "l load   u undo   r reset   s save   h volume   q quit",
                    position=(18, 20), color=R.TEXT_DIM, font_size=9,
                    font_file=R.MONO_FONT_FILE)

@@ -1,4 +1,4 @@
-"""On-screen file menu: rounded, labeled buttons (load tracts / load FA / save).
+"""On-screen file menu: rounded, labeled buttons (load tracts / load volume / save).
 
 VTK has no Qt toolbar, so each entry is a vtkButtonWidget whose two texture
 states (idle / pressed) are small images we render with matplotlib -- real
@@ -14,7 +14,7 @@ from vtk.util.numpy_support import numpy_to_vtk
 
 # (label, Editor method name), top to bottom
 _ITEMS = [("  Load tracts", "load_dialog"),
-          ("  Load image (FA)", "load_fa"),
+          ("  Load volume", "load_volume"),
           ("  Save", "save")]
 
 _BTN_W, _BTN_H = 210, 40

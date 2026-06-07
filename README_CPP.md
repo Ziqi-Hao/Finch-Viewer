@@ -1,5 +1,10 @@
 # C++ local editor
 
+> **macOS / Qt:** the active C++ editor is now `local_editor_qt`, a pure
+> **Qt + OpenGL** app (no VTK). See the *macOS (Homebrew)* section of
+> [DEV_WORKFLOW.md](DEV_WORKFLOW.md). The VTK editor below is legacy and
+> off by default (`-DBUILD_VTK_EDITOR=ON` to build it).
+
 This is a C++/VTK port of `local_editor.py`.
 
 It keeps the same interactive workflow:
@@ -24,12 +29,17 @@ Differences from the Python implementation:
 
 ## Layout
 
-- `local_editor.cpp`: small executable entry point.
-- `cpp/args.*`: command-line parsing.
-- `cpp/trk_io.*`: TrackVis `.trk` loading/saving and RASMM conversion.
-- `cpp/streamline_ops.*`: streamline geometry tests, display sampling, direction RGB.
-- `cpp/editor_app.*`: VTK rendering, box widget, keyboard actions, save workflow.
-- `cpp/utils.*`: small shared helpers.
+All C++ lives under `cpp/`, split into a shared library plus one folder per app:
+
+- `cpp/core/` — the UI-free io/data/compute library (`tracto_core`): `args`,
+  `trk_io` (TrackVis `.trk` load/save + RASMM), `tractogram_store`,
+  `streamline_ops`, `selection_backend`, `statistics`, `display_geometry`,
+  `nifti_io` (VTK-free NIfTI reader), `render_math`, `utils`.
+- `cpp/qt/` — the primary Qt + OpenGL editor (`main.cpp`, `main_window`, `tract_viewport`).
+- `cpp/glfw/` — the GLFW + OpenGL viewer (`main.cpp`, `glfw_tract_viewer`).
+- `cpp/vtk/` — the legacy VTK editor described below (`main.cpp`, `editor_app`), opt-in.
+
+Each app links `tracto_core` and adds only its own renderer/UI.
 
 ## Build
 

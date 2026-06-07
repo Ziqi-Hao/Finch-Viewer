@@ -1,5 +1,6 @@
 #include "tractogram_store.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -57,6 +58,22 @@ void BuildSoA(TractogramStore& store) {
     }
     store.lengthsMm[i] = length;
   }
+}
+
+Bounds RasBounds(const TractogramStore& store) {
+  Bounds b;
+  if (store.x.empty()) {
+    b.v[0] = b.v[2] = b.v[4] = -1.0;
+    b.v[1] = b.v[3] = b.v[5] = 1.0;
+    return b;
+  }
+  const auto xr = std::minmax_element(store.x.begin(), store.x.end());
+  const auto yr = std::minmax_element(store.y.begin(), store.y.end());
+  const auto zr = std::minmax_element(store.z.begin(), store.z.end());
+  b.v[0] = *xr.first;  b.v[1] = *xr.second;
+  b.v[2] = *yr.first;  b.v[3] = *yr.second;
+  b.v[4] = *zr.first;  b.v[5] = *zr.second;
+  return b;
 }
 
 }  // namespace tracto
