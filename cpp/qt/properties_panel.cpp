@@ -1,5 +1,7 @@
 #include "properties_panel.hpp"
 
+#include "histogram_widget.hpp"
+
 #include <QAction>
 #include <QDoubleSpinBox>
 #include <QFontDatabase>
@@ -94,8 +96,20 @@ PropertiesPanel::PropertiesPanel(const EditActions& actions, QWidget* parent)
   }
   root->addWidget(display);
 
+  // ── Contrast: volume intensity histogram with draggable grayscale window. ──
+  contrastCard_ = Card("Contrast");
+  {
+    auto* layout = new QVBoxLayout(contrastCard_);
+    histogram_ = new HistogramWidget;
+    connect(histogram_, &HistogramWidget::rangeChanged, this,
+            &PropertiesPanel::contrastRangeChanged);
+    layout->addWidget(histogram_);
+  }
+  root->addWidget(contrastCard_);
+
   // ── Selection: editable 3-D box bounds + live readout of what it holds. ────
-  QGroupBox* selection = Card("Selection");
+  selectionCard_ = Card("Selection");
+  QGroupBox* selection = selectionCard_;
   {
     auto* grid = new QGridLayout(selection);
     grid->setColumnStretch(1, 1);
@@ -124,32 +138,38 @@ PropertiesPanel::PropertiesPanel(const EditActions& actions, QWidget* parent)
   root->addWidget(selection);
 
   // ── Edit: the same actions as the toolbar, as a button cluster. ───────────
-  QGroupBox* edit = Card("Edit");
+  editCard_ = Card("Edit");
+  QGroupBox* edit = editCard_;
   {
     auto* grid = new QGridLayout(edit);
     QToolButton* del = ActionButton(actions.del);
     del->setObjectName("dangerButton");  // red-on-hover (destructive)
     grid->addWidget(del, 0, 0);
     grid->addWidget(ActionButton(actions.keep), 0, 1);
-    grid->addWidget(ActionButton(actions.undo), 1, 0);
-    grid->addWidget(ActionButton(actions.preview), 1, 1);
+    grid->addWidget(ActionButton(actions.undo), 1, 0, 1, 2);
   }
   root->addWidget(edit);
 
-  // ── Statistics: computed on demand (expensive), not live. ─────────────────
-  QGroupBox* stats = Card("Statistics");
+  // ── Info & Statistics: basic facts (always) + on-demand expensive stats. ──
+  QGroupBox* stats = Card("Info");
   {
     auto* layout = new QVBoxLayout(stats);
-    statsValue_ = MonoValue("—");
+    infoLabel_ = MonoValue("No data loaded.");  // basic volume/tractogram facts (always)
+    infoLabel_->setWordWrap(true);
+    infoLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    statsValue_ = MonoValue("—");                // length / pts-per-line / deleted% (on Refresh)
     statsValue_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    auto* refresh = new QPushButton("Refresh");
+    auto* refresh = new QPushButton("Refresh statistics");
     connect(refresh, &QPushButton::clicked, this, &PropertiesPanel::refreshStatsRequested);
+    layout->addWidget(infoLabel_);
     layout->addWidget(statsValue_);
     layout->addWidget(refresh);
   }
   root->addWidget(stats);
 
   root->addStretch(1);
+  SetEditMode(false);            // start in view mode: Selection + Edit cards hidden
+  contrastCard_->setVisible(false);  // shown once a volume is loaded
 }
 
 void PropertiesPanel::SetDensity(int value, int maxValue) {
@@ -199,5 +219,20 @@ void PropertiesPanel::EmitBox() {
 }
 
 void PropertiesPanel::SetStats(const QString& text) { statsValue_->setText(text); }
+
+void PropertiesPanel::SetInfo(const QString& text) { infoLabel_->setText(text); }
+
+void PropertiesPanel::SetHistogram(bool hasVolume, std::vector<float> bins, double dataMin,
+                                   double dataMax, double lo, double hi) {
+  contrastCard_->setVisible(hasVolume);
+  if (!hasVolume) return;
+  histogram_->SetHistogram(std::move(bins), dataMin, dataMax);
+  histogram_->SetRange(lo, hi);
+}
+
+void PropertiesPanel::SetEditMode(bool on) {
+  selectionCard_->setVisible(on);
+  editCard_->setVisible(on);
+}
 
 }  // namespace tracto

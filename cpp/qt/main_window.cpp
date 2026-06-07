@@ -3,15 +3,17 @@
 #include "display_geometry.hpp"
 #include "nifti_io.hpp"
 #include "properties_panel.hpp"
-#include "scene_panel.hpp"
+#include "layers_panel.hpp"
 #include "selection_backend.hpp"
 #include "statistics.hpp"
 #include "tract_viewport.hpp"
+#include "perf_overlay.hpp"
 #include "trk_io.hpp"
 #include "utils.hpp"
 #include "viewport_hud.hpp"
 
 #include <QAction>
+#include <QCloseEvent>
 #include <QDockWidget>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -20,6 +22,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QStatusBar>
 #include <QTimer>
 #include <QToolBar>
@@ -37,15 +40,21 @@ MainWindow::MainWindow(Args args, QWidget* parent)
     : QMainWindow(parent), args_(std::move(args)) {
   setWindowTitle("Finch-Viewer — tractography editor (Qt/OpenGL)");
 
-  selection_ = CreateCpuSelectionBackend();
+  selection_ = CreateGridSelectionBackend();  // O(box) localized queries; built per load
 
   viewport_ = new TractViewport(this);
   setCentralWidget(viewport_);
+  // Drive the live white in-box highlight: the viewport queries the grid backend
+  // (fast, localized) as the box moves and lights up the streamlines inside it.
+  viewport_->SetSelectionQuery(
+      [this](const Bounds& box) { return selection_->SelectInBox(store_, box); });
 
   // Translucent counts overlay, top-left, over the viewport. Transparent to the
   // mouse so it never eats rotate/pan drags; fixed corner needs no reposition.
   hud_ = new ViewportHud(viewport_);
   hud_->move(12, 12);
+  // Self-contained FPS/CPU/GPU diagnostics, top-right (parents to the viewport).
+  new PerfOverlay(viewport_);
 
   // One QAction per command, shared by the menu bar, the toolbar, and its
   // shortcut — Qt's single-source-of-truth idiom. Slots are defined below.
@@ -61,23 +70,32 @@ MainWindow::MainWindow(Args args, QWidget* parent)
 
   QAction* openTrkAct = act("Open TRK…", "Open a .trk tractogram", &MainWindow::OpenTrk);
   QAction* openVolumeAct = act("Open Volume…", "Load a NIfTI background volume", &MainWindow::OpenVolume);
+  QAction* openLabelAct = act("Open Label…", "Load a NIfTI label / segmentation", &MainWindow::OpenLabel);
   QAction* saveAct = act("Save As…", "Write the surviving streamlines to .trk",
                          &MainWindow::SaveAs, QKeySequence::Save);
-  QAction* deleteAct = act("Delete", "Delete alive streamlines inside the box (D)",
+  QAction* deleteAct = act("Delete", "Delete kept streamlines inside the box (D)",
                            &MainWindow::DeleteInBox, Qt::Key_D);
   QAction* keepAct = act("Keep", "Keep only streamlines inside the box (K)",
                          &MainWindow::KeepInBox, Qt::Key_K);
   QAction* undoAct = act("Undo", "Undo the last edit (U)", &MainWindow::Undo, Qt::Key_U);
   QAction* resetBoxAct = act("Reset Box", "Re-place the selection box in the data (B)",
                              &MainWindow::ResetBox, Qt::Key_B);
-  QAction* previewAct = act("Preview", "Report how many alive streamlines the box holds (P)",
-                            &MainWindow::PreviewBox, Qt::Key_P);
   QAction* toggleVolumeAct = act("Volume", "Toggle the volume slice planes (H)",
                              &MainWindow::ToggleVolume, Qt::Key_H);  // single source for H
+
+  // Edit is an opt-in mode (View is the default core experience). Toggling it on
+  // reveals the selection box + edit tools/cards; off returns to a clean view.
+  editAct_ = new QAction("Edit", this);
+  editAct_->setCheckable(true);
+  editAct_->setToolTip("Edit mode: show the selection box + edit tools (E)");
+  editAct_->setShortcut(Qt::Key_E);
+  connect(editAct_, &QAction::toggled, this, &MainWindow::SetEditMode);
+  editTools_ = {deleteAct, keepAct, undoAct, resetBoxAct};
 
   QMenu* fileMenu = menuBar()->addMenu("&File");
   fileMenu->addAction(openTrkAct);
   fileMenu->addAction(openVolumeAct);
+  fileMenu->addAction(openLabelAct);
   fileMenu->addSeparator();
   fileMenu->addAction(saveAct);
   fileMenu->addSeparator();
@@ -88,11 +106,12 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   editMenu->addAction(keepAct);
   editMenu->addAction(undoAct);
   editMenu->addSeparator();
-  editMenu->addAction(previewAct);
   editMenu->addAction(resetBoxAct);
 
   QMenu* viewMenu = menuBar()->addMenu("&View");
   viewMenu->addAction(toggleVolumeAct);
+  viewMenu->addSeparator();
+  viewMenu->addAction(editAct_);
 
   // Compact, always-visible command strip mirroring the actions.
   QToolBar* toolbar = addToolBar("Main");
@@ -101,21 +120,23 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   toolbar->setToolButtonStyle(Qt::ToolButtonTextOnly);
   toolbar->addAction(openTrkAct);
   toolbar->addAction(openVolumeAct);
+  toolbar->addAction(openLabelAct);
   toolbar->addAction(saveAct);
+  toolbar->addSeparator();
+  // Volume visibility now lives per-layer in the Layers panel, so the toolbar
+  // toggle is redundant — keep it only as the View-menu item + H shortcut.
+  toolbar->addAction(editAct_);  // the View/Edit toggle
   toolbar->addSeparator();
   toolbar->addAction(deleteAct);
   toolbar->addAction(keepAct);
   toolbar->addAction(undoAct);
   toolbar->addAction(resetBoxAct);
-  toolbar->addSeparator();
-  toolbar->addAction(previewAct);
-  toolbar->addAction(toggleVolumeAct);
   if (QWidget* deleteButton = toolbar->widgetForAction(deleteAct))
     deleteButton->setObjectName("dangerButton");  // red-on-hover (destructive)
 
   // Right-dock inspector. Its edit buttons reuse the same QActions as the
   // toolbar; density/step changes route back here to rebuild the display.
-  const EditActions editActions{deleteAct, keepAct, undoAct, previewAct, resetBoxAct};
+  const EditActions editActions{deleteAct, keepAct, undoAct, resetBoxAct};
   properties_ = new PropertiesPanel(editActions);
   properties_->SetDensity(args_.displayN, args_.displayN);
   properties_->SetStep(args_.dispStep);
@@ -131,6 +152,15 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   connect(properties_, &PropertiesPanel::boxChanged, this, [this](const Bounds& box) {
     if (viewport_) viewport_->SetSelectionBox(box);  // typed bounds -> viewport box
   });
+  connect(properties_, &PropertiesPanel::contrastRangeChanged, this, [this](double lo, double hi) {
+    for (VolumeLayer& vl : volumes_) {
+      if (vl.id != activeVolumeId_) continue;
+      vl.winLo = static_cast<float>(lo);  // remember per-volume
+      vl.winHi = static_cast<float>(hi);
+      break;
+    }
+    if (viewport_) viewport_->SetVolumeRange(static_cast<float>(lo), static_cast<float>(hi));
+  });
 
   auto* scroll = new QScrollArea;
   scroll->setWidget(properties_);
@@ -143,16 +173,14 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   dock->setMinimumWidth(248);
   addDockWidget(Qt::RightDockWidgetArea, dock);
 
-  // Left-dock Scene / Layers list.
-  scene_ = new ScenePanel;
-  connect(scene_, &ScenePanel::volumeVisibilityChanged, this, [this](bool visible) {
-    if (viewport_) viewport_->SetVolumeVisible(visible);
-  });
-  auto* sceneDock = new QDockWidget("Scene", this);
-  sceneDock->setWidget(scene_);
-  sceneDock->setFeatures(QDockWidget::NoDockWidgetFeatures);
-  sceneDock->setMinimumWidth(200);
-  addDockWidget(Qt::LeftDockWidgetArea, sceneDock);
+  // Left-dock Layers list (Volume / Tracts / Label; load many, check to show).
+  layers_ = new LayersPanel;
+  connect(layers_, &LayersPanel::visibilityChanged, this, &MainWindow::OnLayerVisibility);
+  auto* layersDock = new QDockWidget("Layers", this);
+  layersDock->setWidget(layers_);
+  layersDock->setFeatures(QDockWidget::NoDockWidgetFeatures);
+  layersDock->setMinimumWidth(200);
+  addDockWidget(Qt::LeftDockWidgetArea, layersDock);
 
   // The viewport owns the box and exposes no change signal, so poll it a few
   // times a second and mirror it into the panel only when it actually moved.
@@ -161,31 +189,85 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   connect(boxTimer, &QTimer::timeout, this, &MainWindow::PollSelectionReadout);
   boxTimer->start();
 
+  SetEditMode(false);  // start in View: edit tools disabled, Selection/Edit cards hidden
   statusBar()->showMessage("No tractogram loaded — File ▸ Open TRK…");
+}
+
+void MainWindow::SetEditMode(bool on) {
+  editMode_ = on;
+  if (viewport_) viewport_->SetEditMode(on);
+  if (properties_) properties_->SetEditMode(on);
+  if (hud_) hud_->setVisible(on);  // the kept/total overlay is shown only while editing
+  for (QAction* a : editTools_) {  // delete/keep/undo/reset: hidden AND disabled in view
+    a->setVisible(on);             // hide the toolbar/menu buttons in view mode
+    a->setEnabled(on);             // disabled => their shortcuts (D/K/U/B) don't fire either
+  }
+  if (editAct_ && editAct_->isChecked() != on) {     // keep the toggle in sync if set in code
+    QSignalBlocker block(editAct_);
+    editAct_->setChecked(on);
+  }
+  UpdateStatus();  // swap the status line between the view hint and the edit count
 }
 
 void MainWindow::LoadTractogram(const QString& path) {
   try {
-    TractogramStore store;
-    store.streamlines = LoadTrk(path.toStdString(), store.header);
-    BuildSoA(store);
-    store_ = std::move(store);
-    aliveFull_.assign(store_.StreamlineCount(), 1);
-    args_.trkPath = path.toStdString();
-    tractRasBounds_ = RasBounds(store_);
-    hasTracts_ = !store_.x.empty();
-    if (hasTracts_) {
-      const Bounds& b = tractRasBounds_;
-      std::printf("loaded %s streamlines · RAS x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f]\n",
-                  FormatCount(store_.StreamlineCount()).c_str(),
-                  b.v[0], b.v[1], b.v[2], b.v[3], b.v[4], b.v[5]);
-      std::fflush(stdout);
+    // Build a fresh bundle (load many TRKs; each is its own layer row).
+    TractBundle b;
+    b.store.streamlines = LoadTrk(path.toStdString(), b.store.header);
+    BuildSoA(b.store);
+    b.alive.assign(b.store.StreamlineCount(), 1);
+    b.rasBounds = RasBounds(b.store);
+    b.name = QFileInfo(path).fileName();
+    b.path = path;
+    const Bounds& rb = b.rasBounds;
+    std::printf("loaded %s streamlines · RAS x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f]\n",
+                FormatCount(b.store.StreamlineCount()).c_str(),
+                rb.v[0], rb.v[1], rb.v[2], rb.v[3], rb.v[4], rb.v[5]);
+    std::fflush(stdout);
+
+    if (layers_) {
+      b.id = layers_->AddLayer(LayersPanel::Kind::Tracts, b.name, true);
+      for (const TractBundle& other : tracts_) layers_->SetVisible(other.id, false);  // exclusive
     }
-    RebuildDisplay();
+    tracts_.push_back(std::move(b));
+    ActivateTracts(static_cast<int>(tracts_.size()) - 1);  // archives the previous active
+    viewport_->SetTractsVisible(true);
     viewport_->ResetCamera();
   } catch (const std::exception& e) {
     ReportError("Load failed", e.what());
   }
+}
+
+void MainWindow::ActivateTracts(int index) {
+  if (index < 0 || index >= static_cast<int>(tracts_.size()) || index == activeTracts_) return;
+  // Archive the current active working state back into its bundle (move, no copy).
+  if (activeTracts_ >= 0 && activeTracts_ < static_cast<int>(tracts_.size())) {
+    TractBundle& cur = tracts_[activeTracts_];
+    cur.store = std::move(store_);
+    cur.alive = std::move(aliveFull_);
+    cur.history = std::move(history_);
+    cur.rasBounds = tractRasBounds_;
+    cur.dirty = tractsDirty_;
+  }
+  // Swap the requested bundle into the active working members.
+  TractBundle& nb = tracts_[index];
+  store_ = std::move(nb.store);
+  aliveFull_ = std::move(nb.alive);
+  history_ = std::move(nb.history);
+  tractRasBounds_ = nb.rasBounds;
+  tractsDirty_ = nb.dirty;
+  args_.trkPath = nb.path.toStdString();
+  hasTracts_ = !store_.x.empty();
+  activeTracts_ = index;
+  selection_->Build(store_);  // rebuild the grid index for the now-active tractogram
+  RebuildDisplay();
+}
+
+bool MainWindow::AnyTractsDirty() const {
+  if (tractsDirty_) return true;  // the active one
+  for (int i = 0; i < static_cast<int>(tracts_.size()); ++i)
+    if (i != activeTracts_ && tracts_[i].dirty) return true;
+  return false;
 }
 
 void MainWindow::OpenTrk() {
@@ -196,28 +278,42 @@ void MainWindow::OpenTrk() {
   }
 }
 
-void MainWindow::LoadVolume(const QString& path) {
+void MainWindow::LoadVolume(const QString& path) { LoadVolumeLayer(path, false); }
+void MainWindow::LoadLabel(const QString& path) { LoadVolumeLayer(path, true); }
+
+void MainWindow::LoadVolumeLayer(const QString& path, bool isLabel) {
+  // A label is also a scalar NIfTI; for now it renders through the same volume
+  // path (grayscale). Per-label colouring is Stage 4. Both share the single
+  // volume render slot, so checking one makes it the active rendered image.
   try {
     Volume volume = LoadNifti(path.toStdString());
     const Bounds wb = WorldBounds(volume);
     const int dx = volume.dims[0], dy = volume.dims[1], dz = volume.dims[2];
-    std::printf("loaded volume %dx%dx%d · range[%.3f,%.3f] · RAS x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f]\n",
-                dx, dy, dz, volume.valueMin, volume.valueMax,
+    std::printf("loaded %s %dx%dx%d · range[%.3f,%.3f] · RAS x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f]\n",
+                isLabel ? "label" : "volume", dx, dy, dz, volume.valueMin, volume.valueMax,
                 wb.v[0], wb.v[1], wb.v[2], wb.v[3], wb.v[4], wb.v[5]);
     std::fflush(stdout);
 
     args_.volumePath = path.toStdString();
-    const float vmin = volume.valueMin, vmax = volume.valueMax;  // capture before move
-    viewport_->SetVolume(std::move(volume));  // move: no multi-MB voxel copy
+    const QString name = QFileInfo(path).fileName();
+    const float vmin = volume.valueMin, vmax = volume.valueMax;  // window default before move
 
-    volumeName_ = QFileInfo(path).fileName();
-    volumeInfo_ = QStringLiteral("%1×%2×%3 · [%4, %5]")
-                      .arg(dx).arg(dy).arg(dz).arg(vmin, 0, 'g', 3).arg(vmax, 0, 'g', 3);
-    if (scene_) scene_->SetVolume(true, volumeName_, volumeInfo_, viewport_->VolumeVisible());
+    // Add a layer row in the right group; checking it makes it the active image,
+    // so a fresh load auto-unchecks the other volume/label rows (single render).
+    const auto kind = isLabel ? LayersPanel::Kind::Label : LayersPanel::Kind::Volume;
+    const int id = layers_->AddLayer(kind, name, true);
+    for (const VolumeLayer& other : volumes_) layers_->SetVisible(other.id, false);
+    VolumeLayer layer{std::move(volume), name, id, isLabel, vmin, vmax};
+    ComputeHistogram(layer);  // fills histBins + adaptive [dispMin,dispMax]; sets the window
+    volumes_.push_back(std::move(layer));  // keep our copy (data + histogram + window)
+    activeVolumeId_ = id;
+    viewport_->SetVolume(volumes_.back().vol);  // copies into the viewport texture
+    viewport_->SetVolumeVisible(true);
+    UpdateInfo();
+    UpdateHistogram();
 
-    // Space sanity: a volume in a different space from the tractogram lands
+    // Space sanity: an image in a different space from the tractogram lands
     // off-screen (the outputWarped vs SUBG08 mixup). Warn instead of confusing.
-    // Timed messages auto-revert to the persistent alive/controls status line.
     const bool mismatch =
         hasTracts_ &&
         (wb.v[1] < tractRasBounds_.v[0] || wb.v[0] > tractRasBounds_.v[1] ||
@@ -225,27 +321,72 @@ void MainWindow::LoadVolume(const QString& path) {
          wb.v[5] < tractRasBounds_.v[4] || wb.v[4] > tractRasBounds_.v[5]);
     if (mismatch) {
       statusBar()->showMessage(
-          "⚠ Volume does not overlap the streamlines — likely a different space.", 12000);
+          "⚠ Image does not overlap the streamlines — likely a different space.", 12000);
     } else {
-      statusBar()->showMessage(QString("Volume loaded: %1×%2×%3").arg(dx).arg(dy).arg(dz), 8000);
+      statusBar()->showMessage(
+          QString("%1 loaded: %2×%3×%4").arg(isLabel ? "Label" : "Volume").arg(dx).arg(dy).arg(dz),
+          8000);
     }
   } catch (const std::exception& e) {
-    ReportError("Volume load failed", e.what());
+    ReportError(isLabel ? "Label load failed" : "Volume load failed", e.what());
   }
 }
 
 void MainWindow::OpenVolume() {
   const QString path = QFileDialog::getOpenFileName(this, "Open volume", QString(),
                                                     "NIfTI (*.nii *.nii.gz)");
-  if (!path.isEmpty()) {
-    LoadVolume(path);
-  }
+  if (!path.isEmpty()) LoadVolume(path);
+}
+
+void MainWindow::OpenLabel() {
+  const QString path = QFileDialog::getOpenFileName(this, "Open label / segmentation", QString(),
+                                                    "NIfTI (*.nii *.nii.gz)");
+  if (!path.isEmpty()) LoadLabel(path);
 }
 
 void MainWindow::ToggleVolume() {
+  if (activeVolumeId_ < 0) return;  // no volume to toggle
   const bool visible = !viewport_->VolumeVisible();
   viewport_->SetVolumeVisible(visible);
-  if (scene_) scene_->SetVolumeVisibleState(visible);  // keep the Scene checkbox in sync
+  if (layers_) layers_->SetVisible(activeVolumeId_, visible);  // keep the layer checkbox in sync
+}
+
+void MainWindow::OnLayerVisibility(int id, bool on) {
+  // A volume layer: the viewport renders one volume at a time, so checking one
+  // makes it active and unchecks the others; unchecking the active one hides it.
+  for (const VolumeLayer& vl : volumes_) {
+    if (vl.id != id) continue;
+    if (on) {
+      for (const VolumeLayer& other : volumes_)
+        if (other.id != id) layers_->SetVisible(other.id, false);
+      activeVolumeId_ = id;
+      viewport_->SetVolume(vl.vol);  // copy into the viewport texture
+      viewport_->SetVolumeVisible(true);
+    } else if (activeVolumeId_ == id) {
+      viewport_->SetVolumeVisible(false);
+      activeVolumeId_ = -1;
+    }
+    UpdateInfo();
+    UpdateHistogram();
+    return;
+  }
+  // A tractogram layer: one renders at a time, so checking one activates it (and
+  // unchecks the others); unchecking the active one hides the streamlines.
+  for (int i = 0; i < static_cast<int>(tracts_.size()); ++i) {
+    if (tracts_[i].id != id) continue;
+    if (on) {
+      for (int j = 0; j < static_cast<int>(tracts_.size()); ++j)
+        if (j != i) layers_->SetVisible(tracts_[j].id, false);
+      if (i != activeTracts_) {
+        ActivateTracts(i);
+        viewport_->ResetCamera();
+      }
+      viewport_->SetTractsVisible(true);
+    } else if (i == activeTracts_) {
+      viewport_->SetTractsVisible(false);
+    }
+    return;
+  }
 }
 
 bool MainWindow::SaveScreenshot(const QString& path) {
@@ -273,15 +414,37 @@ void MainWindow::SaveAs() {
   }
   const std::size_t kept =
       static_cast<std::size_t>(std::count(aliveFull_.begin(), aliveFull_.end(), uint8_t{1}));
+  tractsDirty_ = false;  // edits are now persisted
   statusBar()->showMessage(
       QString("Saved %1 streamlines → %2").arg(QString::fromStdString(FormatCount(kept)), path));
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+  // Prompt before discarding unsaved edits. (Only the tractogram is editable for
+  // now; MRI/label join this check once they become editable.)
+  if (!AnyTractsDirty() || !args_.screenshotPath.empty()) {  // no modal in headless runs
+    event->accept();
+    return;
+  }
+  const auto choice = QMessageBox::warning(
+      this, "Unsaved changes",
+      "There are unsaved tractogram edits. Save before closing?",
+      QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
+  if (choice == QMessageBox::Discard) {
+    event->accept();
+  } else if (choice == QMessageBox::Save) {
+    SaveAs();
+    tractsDirty_ ? event->ignore() : event->accept();  // still dirty => save was cancelled
+  } else {
+    event->ignore();
+  }
 }
 
 void MainWindow::RebuildDisplay() {
   LineGeometry geo = BuildDisplayLineGeometry(
       store_, aliveFull_, args_.displayN, args_.dispStep, args_.seed);
   const Bounds bounds = geo.bounds;
-  viewport_->SetLineGeometry(std::move(geo.vertices), bounds);  // move: no multi-MB copy
+  viewport_->SetLineGeometry(std::move(geo.vertices), std::move(geo.spans), bounds);
   UpdateStatus();
 }
 
@@ -294,20 +457,26 @@ void MainWindow::ReportError(const QString& title, const QString& message) {
 }
 
 void MainWindow::UpdateStatus() {
-  const std::size_t alive =
+  const std::size_t kept =
       static_cast<std::size_t>(std::count(aliveFull_.begin(), aliveFull_.end(), uint8_t{1}));
-  statusBar()->showMessage(
-      QString("alive %1 / %2   ·   cap %3 step %4   ·   drag box handles · d=delete k=keep u=undo p=preview b=reset-box · R=recenter H=volume")
-          .arg(QString::fromStdString(FormatCount(alive)),
-               QString::fromStdString(FormatCount(store_.StreamlineCount())),
-               QString::number(args_.displayN),
-               QString::number(args_.dispStep)));
+  // The kept/total count is an editing concern: show it only in Edit mode. View
+  // mode keeps a clean navigation hint with no running count.
+  if (editMode_) {
+    statusBar()->showMessage(
+        QString("kept %1 / %2   ·   cap %3 step %4   ·   drag handles · d delete · k keep · u undo · b reset-box")
+            .arg(QString::fromStdString(FormatCount(kept)),
+                 QString::fromStdString(FormatCount(store_.StreamlineCount())),
+                 QString::number(args_.displayN),
+                 QString::number(args_.dispStep)));
+  } else {
+    statusBar()->showMessage(
+        "drag rotate · right-drag pan · wheel zoom · double-click pane to maximize · R recenter · E edit");
+  }
 
   const QString name = args_.trkPath.empty()
                            ? QStringLiteral("untitled")
                            : QFileInfo(QString::fromStdString(args_.trkPath)).fileName();
-  if (hud_) hud_->SetInfo(name, alive, store_.StreamlineCount());
-  if (scene_) scene_->SetTractogram(name, alive, store_.StreamlineCount());
+  if (hud_) hud_->SetInfo(name, kept, store_.StreamlineCount());  // HUD is shown only in Edit
 
   if (properties_) {
     const int total = static_cast<int>(std::max<std::size_t>(1, store_.StreamlineCount()));
@@ -317,6 +486,71 @@ void MainWindow::UpdateStatus() {
     // (the box may not have moved, but the edit changed what it holds).
     lastBox_.v[0] = std::nan("");
   }
+  UpdateInfo();
+}
+
+void MainWindow::UpdateInfo() {
+  if (!properties_) return;
+  QString s;
+  if (activeTracts_ >= 0 && activeTracts_ < static_cast<int>(tracts_.size())) {
+    s += QStringLiteral("Tracts:  %1\n         %2 streamlines\n\n")
+             .arg(tracts_[activeTracts_].name,
+                  QString::fromStdString(FormatCount(store_.StreamlineCount())));
+  }
+  for (const VolumeLayer& vl : volumes_) {
+    if (vl.id != activeVolumeId_) continue;
+    s += QStringLiteral("%1:  %2\n         %3×%4×%5   [%6, %7]")
+             .arg(vl.isLabel ? "Label" : "Volume", vl.name)
+             .arg(vl.vol.dims[0]).arg(vl.vol.dims[1]).arg(vl.vol.dims[2])
+             .arg(vl.vol.valueMin, 0, 'g', 3).arg(vl.vol.valueMax, 0, 'g', 3);
+    break;
+  }
+  properties_->SetInfo(s.isEmpty() ? QStringLiteral("No data loaded.") : s.trimmed());
+}
+
+void MainWindow::ComputeHistogram(VolumeLayer& vl) {
+  // Adaptive intensity axis: a few bright outliers shouldn't squash the bulk of
+  // the data to the left, so cap the displayed max at the 99.5th percentile. The
+  // default window uses that same robust range (FSLeyes-style auto contrast).
+  const Volume& v = vl.vol;
+  const float dmin = v.valueMin;
+  const float dmax = (v.valueMax > v.valueMin) ? v.valueMax : v.valueMin + 1.0f;
+  constexpr int kFine = 1024;
+  std::vector<double> fine(kFine, 0.0);
+  const double finv = static_cast<double>(kFine - 1) / (static_cast<double>(dmax) - dmin);
+  for (float s : v.data) fine[std::clamp(static_cast<int>((static_cast<double>(s) - dmin) * finv),
+                                         0, kFine - 1)] += 1.0;
+  const double total = std::max(1.0, static_cast<double>(v.data.size()));
+  double cum = 0.0;
+  int robBin = kFine - 1;
+  for (int i = 0; i < kFine; ++i) { cum += fine[i]; if (cum >= 0.995 * total) { robBin = i; break; } }
+
+  vl.dispMin = dmin;
+  vl.dispMax = dmin + static_cast<float>(robBin + 1) / kFine * (dmax - dmin);
+  if (vl.dispMax <= vl.dispMin) vl.dispMax = dmax;
+  vl.winLo = vl.dispMin;
+  vl.winHi = vl.dispMax;
+
+  // 160 display bins over [dispMin, dispMax], aggregated from the fine bins.
+  constexpr int kDisp = 160;
+  vl.histBins.assign(kDisp, 0.0f);
+  const float span = std::max(1e-9f, vl.dispMax - vl.dispMin);
+  for (int j = 0; j < kFine; ++j) {
+    const double cj = dmin + (j + 0.5) / kFine * (static_cast<double>(dmax) - dmin);
+    const int db = std::clamp(static_cast<int>((cj - vl.dispMin) / span * kDisp), 0, kDisp - 1);
+    vl.histBins[db] += static_cast<float>(fine[j]);
+  }
+}
+
+void MainWindow::UpdateHistogram() {
+  if (!properties_) return;
+  for (const VolumeLayer& vl : volumes_) {
+    if (vl.id != activeVolumeId_) continue;
+    properties_->SetHistogram(true, vl.histBins, vl.dispMin, vl.dispMax, vl.winLo, vl.winHi);
+    if (viewport_) viewport_->SetVolumeRange(vl.winLo, vl.winHi);
+    return;
+  }
+  properties_->SetHistogram(false, {}, 0.0, 0.0, 0.0, 0.0);  // no active volume
 }
 
 void MainWindow::RefreshStats() {
@@ -335,7 +569,7 @@ void MainWindow::RefreshStats() {
                    : QStringLiteral("—");
   };
   properties_->SetStats(
-      QStringLiteral("alive   %1 / %2  (%3% deleted)\nlength  %4 mm\npts/ln  %5")
+      QStringLiteral("kept    %1 / %2  (%3% deleted)\nlength  %4 mm\npts/ln  %5")
           .arg(QString::fromStdString(FormatCount(s.aliveCount)),
                QString::fromStdString(FormatCount(s.fullCount)))
           .arg(s.deletedPercent, 0, 'f', 1)
@@ -382,6 +616,7 @@ void MainWindow::PushHistory() {
   constexpr std::size_t kMaxUndo = 50;
   history_.push_back(aliveFull_);
   if (history_.size() > kMaxUndo) history_.erase(history_.begin());
+  tractsDirty_ = true;  // an edit is about to happen -> unsaved changes
 }
 
 void MainWindow::DeleteInBox() {
@@ -389,7 +624,7 @@ void MainWindow::DeleteInBox() {
   const std::vector<uint8_t> inBox = selection_->SelectInBox(store_, viewport_->SelectionBox());
   const std::size_t nKill = CountInBox(inBox);
   if (nKill == 0) {
-    statusBar()->showMessage("Box holds no alive streamlines.", 4000);
+    statusBar()->showMessage("Box holds no kept streamlines.", 4000);
     return;
   }
   PushHistory();
@@ -405,7 +640,7 @@ void MainWindow::KeepInBox() {
   const std::vector<uint8_t> inBox = selection_->SelectInBox(store_, viewport_->SelectionBox());
   const std::size_t nKeep = CountInBox(inBox);
   if (nKeep == 0) {
-    statusBar()->showMessage("Box holds no alive streamlines.", 4000);
+    statusBar()->showMessage("Box holds no kept streamlines.", 4000);
     return;
   }
   PushHistory();
@@ -423,22 +658,9 @@ void MainWindow::Undo() {
   }
   aliveFull_ = std::move(history_.back());
   history_.pop_back();
+  tractsDirty_ = true;  // state changed from the last save
   RebuildDisplay();
   statusBar()->showMessage("Undo.", 3000);
-}
-
-void MainWindow::PreviewBox() {
-  if (!hasTracts_ || !viewport_->HasSelectionBox()) return;
-  const std::vector<uint8_t> inBox = selection_->SelectInBox(store_, viewport_->SelectionBox());
-  const std::size_t n = CountInBox(inBox);
-  const std::size_t alive = std::max<std::size_t>(
-      1, static_cast<std::size_t>(std::count(aliveFull_.begin(), aliveFull_.end(), uint8_t{1})));
-  const double pct = 100.0 * static_cast<double>(n) / static_cast<double>(alive);
-  statusBar()->showMessage(
-      QString("Box holds %1 alive streamlines (%2%) — d deletes them, k keeps only them.")
-          .arg(QString::fromStdString(FormatCount(n)))
-          .arg(pct, 0, 'f', 1),
-      6000);
 }
 
 void MainWindow::ResetBox() {

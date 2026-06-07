@@ -33,7 +33,7 @@ ViewportHud::ViewportHud(QWidget* parent) : QFrame(parent) {
 void ViewportHud::SetInfo(const QString& title, qulonglong alive, qulonglong total) {
   const QLocale loc;
   titleLabel_->setText(title);
-  countLabel_->setText(QStringLiteral("alive %1 / %2").arg(loc.toString(alive), loc.toString(total)));
+  countLabel_->setText(QStringLiteral("kept %1 / %2").arg(loc.toString(alive), loc.toString(total)));
   adjustSize();
   show();
 }

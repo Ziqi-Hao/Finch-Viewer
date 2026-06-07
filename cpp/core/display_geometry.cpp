@@ -43,11 +43,20 @@ LineGeometry BuildDisplayLineGeometry(const TractogramStore& store,
                                       int dispStep,
                                       uint64_t seed) {
   LineGeometry geo;
-  const std::vector<int> display = MakeDisplayIndicesFromAlive(alive, displayN, seed);
+  // Sample a STABLE subset of the full set (independent of `alive`) and emit only
+  // its alive members. Because the sample doesn't change when `alive` changes, an
+  // edit leaves the surviving lines exactly in place and the deleted ones simply
+  // vanish — no reshuffle (the Python "NaN-hide" stable-view behaviour). The
+  // sample is only re-picked when displayN / the streamline count change.
+  const std::vector<int> display =
+      MakeDisplayIndices(static_cast<int>(store.StreamlineCount()), displayN, seed);
   const int step = std::max(1, dispStep);
   bool boundsInitialized = false;
 
   for (int fullIndex : display) {
+    if (static_cast<std::size_t>(fullIndex) >= alive.size() || !alive[static_cast<std::size_t>(fullIndex)]) {
+      continue;  // dead -> skip (vanishes in place; survivors keep their slots)
+    }
     const Streamline& sl = store.streamlines[static_cast<std::size_t>(fullIndex)];
     if (sl.pointCount < 2) {
       continue;
@@ -76,6 +85,7 @@ LineGeometry BuildDisplayLineGeometry(const TractogramStore& store,
       continue;
     }
 
+    const auto firstVertex = static_cast<uint32_t>(geo.vertices.size() / 6);
     for (std::size_t p = 0; p + 1 < count; ++p) {
       const float* a = points.data() + p * 3;
       const float* b = points.data() + (p + 1) * 3;
@@ -84,6 +94,8 @@ LineGeometry BuildDisplayLineGeometry(const TractogramStore& store,
       ExpandBounds(geo.bounds, a, boundsInitialized);
       ExpandBounds(geo.bounds, b, boundsInitialized);
     }
+    const auto vcount = static_cast<uint32_t>(geo.vertices.size() / 6) - firstVertex;
+    geo.spans.push_back({fullIndex, firstVertex, vcount});
   }
 
   if (!boundsInitialized) {

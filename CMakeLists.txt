@@ -124,8 +124,10 @@ if(Qt6_FOUND)
     cpp/qt/tract_viewport.cpp
     cpp/qt/theme.cpp
     cpp/qt/viewport_hud.cpp
+    cpp/qt/perf_overlay.cpp
     cpp/qt/properties_panel.cpp
-    cpp/qt/scene_panel.cpp
+    cpp/qt/layers_panel.cpp
+    cpp/qt/histogram_widget.cpp
     ${QT_RHI_QRC}
   )
   add_dependencies(local_editor_qt qt_rhi_shaders)

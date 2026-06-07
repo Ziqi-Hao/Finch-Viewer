@@ -9,13 +9,18 @@
 
 #include <QWidget>
 
+#include <vector>
+
 class QAction;
 class QDoubleSpinBox;
+class QGroupBox;
 class QLabel;
 class QSlider;
 class QSpinBox;
 
 namespace tracto {
+
+class HistogramWidget;
 
 // The edit commands, shared with the menu/toolbar so the panel buttons are the
 // same single-source-of-truth QActions (enabled state etc. stays in sync).
@@ -23,7 +28,6 @@ struct EditActions {
   QAction* del = nullptr;
   QAction* keep = nullptr;
   QAction* undo = nullptr;
-  QAction* preview = nullptr;
   QAction* resetBox = nullptr;
 };
 
@@ -36,11 +40,18 @@ class PropertiesPanel : public QWidget {
   void SetStep(int value);
   void SetBox(bool hasBox, const Bounds& box, qulonglong inBoxAlive, double pct);
   void SetStats(const QString& text);
+  void SetInfo(const QString& text);  // basic active volume/tractogram info (always shown)
+  // Volume intensity histogram + current grayscale window (data units). hasVolume
+  // false hides the Contrast card.
+  void SetHistogram(bool hasVolume, std::vector<float> bins, double dataMin, double dataMax,
+                    double lo, double hi);
+  void SetEditMode(bool on);  // show/hide the Selection + Edit cards (view vs edit)
 
  signals:
   void densityChanged(int displayN);
   void stepChanged(int dispStep);
   void boxChanged(const Bounds& box);  // user typed new box bounds
+  void contrastRangeChanged(double lo, double hi);  // grayscale window dragged
   void refreshStatsRequested();
 
  private:
@@ -50,6 +61,11 @@ class PropertiesPanel : public QWidget {
   // not trigger a redundant rebuild).
   void CommitDensity(int displayN);
 
+  QLabel* infoLabel_ = nullptr;         // top: basic volume/tractogram info
+  QGroupBox* contrastCard_ = nullptr;   // hidden when no volume is active
+  HistogramWidget* histogram_ = nullptr;
+  QGroupBox* selectionCard_ = nullptr;  // hidden in view mode
+  QGroupBox* editCard_ = nullptr;       // hidden in view mode
   QSlider* densitySlider_;
   QSpinBox* densitySpin_;
   QSpinBox* stepSpin_;

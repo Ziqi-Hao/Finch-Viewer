@@ -14,10 +14,19 @@
 
 namespace tracto {
 
+// Maps one displayed streamline to its contiguous run of vertices in the buffer
+// (so a renderer can highlight a subset without re-deriving geometry).
+struct DisplaySpan {
+  int fullId;             // full-set streamline index
+  uint32_t firstVertex;   // first vertex of this streamline in `vertices`
+  uint32_t vertexCount;   // number of vertices (GL_LINES, so even)
+};
+
 struct LineGeometry {
   // Interleaved [x, y, z, r, g, b] per vertex (rgb in 0..1). Drawn as GL_LINES,
   // i.e. two consecutive vertices per segment.
   std::vector<float> vertices;
+  std::vector<DisplaySpan> spans;  // one per displayed streamline, in buffer order
   Bounds bounds;
 
   std::size_t VertexCount() const { return vertices.size() / 6; }

@@ -81,6 +81,69 @@ inline Mat4 LookAt(Vec3 eye, Vec3 center, Vec3 up) {
   return out;
 }
 
+// Row-major GL-style orthographic projection (z in [-1, 1]); like Perspective,
+// it is corrected for RHI clip space by clipSpaceCorrMatrix() at upload.
+inline Mat4 Ortho(float l, float r, float b, float t, float n, float f) {
+  Mat4 out;
+  out.m[0] = 2.0f / (r - l);   out.m[3] = -(r + l) / (r - l);
+  out.m[5] = 2.0f / (t - b);   out.m[7] = -(t + b) / (t - b);
+  out.m[10] = -2.0f / (f - n); out.m[11] = -(f + n) / (f - n);
+  out.m[15] = 1.0f;
+  return out;
+}
+
+// Inverse of a row-major affine (last row [0 0 0 1]) — invert the 3x3 then the
+// translation. Used for world->voxel (focus point -> slice index). Identity on a
+// singular matrix.
+inline Mat4 InverseAffine(const Mat4& m) {
+  const float a = m.m[0], b = m.m[1], c = m.m[2];
+  const float d = m.m[4], e = m.m[5], f = m.m[6];
+  const float g = m.m[8], h = m.m[9], i = m.m[10];
+  const float A = e * i - f * h, B = f * g - d * i, C = d * h - e * g;
+  const float det = a * A + b * B + c * C;
+  if (std::abs(det) < 1e-12f) return Identity();
+  const float id = 1.0f / det;
+  const float r0 = A * id, r1 = (c * h - b * i) * id, r2 = (b * f - c * e) * id;
+  const float r3 = B * id, r4 = (a * i - c * g) * id, r5 = (c * d - a * f) * id;
+  const float r6 = C * id, r7 = (b * g - a * h) * id, r8 = (a * e - b * d) * id;
+  const float tx = m.m[3], ty = m.m[7], tz = m.m[11];
+  Mat4 out;
+  out.m[0] = r0; out.m[1] = r1; out.m[2] = r2;  out.m[3] = -(r0 * tx + r1 * ty + r2 * tz);
+  out.m[4] = r3; out.m[5] = r4; out.m[6] = r5;  out.m[7] = -(r3 * tx + r4 * ty + r5 * tz);
+  out.m[8] = r6; out.m[9] = r7; out.m[10] = r8; out.m[11] = -(r6 * tx + r7 * ty + r8 * tz);
+  out.m[15] = 1.0f;
+  return out;
+}
+
+// General row-major 4x4 inverse (Gauss-Jordan). Used to unproject the cursor to a
+// world-space ray. Returns identity on a singular matrix.
+inline Mat4 Inverse(const Mat4& m) {
+  double a[4][8];
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) { a[r][c] = m.m[r * 4 + c]; a[r][4 + c] = (r == c) ? 1.0 : 0.0; }
+  for (int col = 0; col < 4; ++col) {
+    int piv = col;
+    double best = std::abs(a[col][col]);
+    for (int r = col + 1; r < 4; ++r)
+      if (std::abs(a[r][col]) > best) { best = std::abs(a[r][col]); piv = r; }
+    if (best < 1e-20) return Identity();
+    if (piv != col)
+      for (int c = 0; c < 8; ++c) { const double t = a[col][c]; a[col][c] = a[piv][c]; a[piv][c] = t; }
+    const double d = a[col][col];
+    for (int c = 0; c < 8; ++c) a[col][c] /= d;
+    for (int r = 0; r < 4; ++r) {
+      if (r == col) continue;
+      const double f = a[r][col];
+      if (f != 0.0)
+        for (int c = 0; c < 8; ++c) a[r][c] -= f * a[col][c];
+    }
+  }
+  Mat4 out;
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) out.m[r * 4 + c] = static_cast<float>(a[r][4 + c]);
+  return out;
+}
+
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kFovYRadians = 50.0f * kPi / 180.0f;  // shared by ViewProj + ZoomToCursor
 
@@ -97,8 +160,11 @@ struct OrbitCamera {
   Vec3 target{0.0f, 0.0f, 0.0f};
   float radius = 1.0f;
   float distance = 3.0f;
-  float yaw = 0.0f;
-  float pitch = 0.22f;
+  // Default: a 45° superior-oblique view. The eye sits in the anterior-right-
+  // superior octant (yaw -45°, pitch -45°) so in RAS the frontal lobe (+Y) lands
+  // bottom-right and the occipital (-Y) top-left, looking 45° down from above.
+  float yaw = -0.785398f;    // -pi/4
+  float pitch = -0.785398f;  // -pi/4 (negative = eye above, looking down)
 
   // Centre on the data and back off to fit its bounding diagonal.
   void Frame(const Bounds& b) {
@@ -110,8 +176,8 @@ struct OrbitCamera {
     const float dz = static_cast<float>(b.v[5] - b.v[4]);
     radius = std::max(1.0f, 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz));
     distance = radius * 3.0f;
-    yaw = 0.0f;
-    pitch = 0.22f;
+    yaw = -kPi / 4.0f;    // superior-oblique default (see member init above)
+    pitch = -kPi / 4.0f;
   }
 
   void Rotate(double dx, double dy) {
@@ -175,6 +241,76 @@ struct OrbitCamera {
     const Mat4 view = LookAt(Eye(), target, Up());
     const Mat4 proj =
         Perspective(kFovYRadians, std::max(1e-3f, aspect), radius * 0.01f, radius * 80.0f);
+    return Multiply(proj, view);
+  }
+};
+
+// Axis-locked orthographic camera for the 2-D slice panes (sagittal/coronal/
+// axial). It looks straight down one world axis at a focus point and only pans,
+// zooms, and scrubs the slice — no rotation. axis: 0=X (sagittal), 1=Y
+// (coronal), 2=Z (axial). `focus` is the shared linked crosshair; the pane shows
+// the slice at focus[axis]. Right()/Up() are the on-screen world axes (matched to
+// LookAt's basis so panning moves the focus in true screen directions).
+struct OrthoSliceCamera {
+  int axis = 2;
+  Vec3 focus{0.0f, 0.0f, 0.0f};
+  float halfH = 1.0f;       // half view height in world mm (zoom)
+  float depth = 100.0f;     // half ortho depth; large enough to span the data
+
+  void Frame(const Bounds& b, int ax) {
+    axis = ax;
+    focus = {static_cast<float>(0.5 * (b.v[0] + b.v[1])),
+             static_cast<float>(0.5 * (b.v[2] + b.v[3])),
+             static_cast<float>(0.5 * (b.v[4] + b.v[5]))};
+    const float ex = static_cast<float>(b.v[1] - b.v[0]);
+    const float ey = static_cast<float>(b.v[3] - b.v[2]);
+    const float ez = static_cast<float>(b.v[5] - b.v[4]);
+    const Vec3 r = Right(), u = Up();
+    const float halfW = 0.5f * (std::abs(r.x) * ex + std::abs(r.y) * ey + std::abs(r.z) * ez);
+    const float halfHt = 0.5f * (std::abs(u.x) * ex + std::abs(u.y) * ey + std::abs(u.z) * ez);
+    halfH = std::max(1.0f, std::max(halfW, halfHt)) * 1.05f;  // margin; aspect added in ViewProj
+    depth = std::max(1.0f, ex + ey + ez);
+  }
+
+  // Screen-right / screen-up / into-screen in world, for the locked axis. These
+  // equal LookAt(Eye(), focus, Up())'s basis (verified per axis).
+  Vec3 Right() const {
+    if (axis == 0) return {0.0f, 1.0f, 0.0f};   // sagittal: +Y to the right
+    if (axis == 1) return {-1.0f, 0.0f, 0.0f};  // coronal:  -X to the right
+    return {1.0f, 0.0f, 0.0f};                  // axial:    +X to the right
+  }
+  Vec3 Up() const { return axis == 2 ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{0.0f, 0.0f, 1.0f}; }
+  Vec3 Forward() const {
+    return {axis == 0 ? -1.0f : 0.0f, axis == 1 ? -1.0f : 0.0f, axis == 2 ? -1.0f : 0.0f};
+  }
+  Vec3 Eye() const { return focus - Forward() * depth; }
+
+  void Zoom(double steps) {
+    halfH *= std::pow(0.88f, static_cast<float>(steps));
+    halfH = std::clamp(halfH, 0.1f, 1.0e5f);
+  }
+
+  // Grab-style pan: content follows the cursor (focus moves opposite the drag in
+  // x, with it in y since screen-y points down). dx/dy are pixels; px the pane size.
+  void Pan(double dx, double dy, int pxW, int pxH) {
+    const float halfW = halfH * (pxH > 0 ? static_cast<float>(pxW) / pxH : 1.0f);
+    const float worldPerPxX = (2.0f * halfW) / std::max(1, pxW);
+    const float worldPerPxY = (2.0f * halfH) / std::max(1, pxH);
+    focus = focus - Right() * static_cast<float>(dx * worldPerPxX) +
+            Up() * static_cast<float>(dy * worldPerPxY);
+  }
+
+  void Scrub(float worldDelta) {  // move the slice along the locked axis
+    if (axis == 0) focus.x += worldDelta;
+    else if (axis == 1) focus.y += worldDelta;
+    else focus.z += worldDelta;
+  }
+  float SliceCoord() const { return axis == 0 ? focus.x : axis == 1 ? focus.y : focus.z; }
+
+  Mat4 ViewProj(float aspect) const {
+    const Mat4 view = LookAt(Eye(), focus, Up());
+    const float halfW = halfH * std::max(1.0e-3f, aspect);
+    const Mat4 proj = Ortho(-halfW, halfW, -halfH, halfH, 0.0f, 2.0f * depth);
     return Multiply(proj, view);
   }
 };
