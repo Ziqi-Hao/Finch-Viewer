@@ -15,6 +15,8 @@ void Usage(const char* exe) {
       << "  --disp-step N   draw every N-th point per streamline, default 2\n"
       << "  --seed N        deterministic display subsampling seed, default 0\n"
       << "  --no-fa         start without FA slices, useful for display debugging\n"
+      << "  --front-buffer  draw directly to the front buffer for display debugging\n"
+      << "  --screenshot P  render one frame to PNG and exit\n"
       << "  --help          show this help\n";
 }
 
@@ -43,6 +45,10 @@ Args ParseArgs(int argc, char** argv) {
       args.seed = static_cast<uint64_t>(std::stoull(requireValue(key)));
     } else if (key == "--no-fa") {
       args.noFa = true;
+    } else if (key == "--front-buffer") {
+      args.frontBuffer = true;
+    } else if (key == "--screenshot") {
+      args.screenshotPath = requireValue(key);
     } else if (key == "--help" || key == "-h") {
       Usage(argv[0]);
       std::exit(0);

@@ -20,9 +20,23 @@ find_package(VTK REQUIRED COMPONENTS
   RenderingCore
   RenderingFreeType
   RenderingOpenGL2
+  RenderingUI
 )
 
 find_package(OpenMP)
+
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(dmri-explorer/deps/glfw-3.3.6 EXCLUDE_FROM_ALL)
+
+add_library(tracto_glad STATIC
+  dmri-explorer/deps/glad/src/glad.c
+)
+
+target_include_directories(tracto_glad PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/dmri-explorer/deps/glad/include
+)
 
 add_executable(local_editor_cpp
   local_editor.cpp
@@ -53,3 +67,12 @@ if(COMMAND vtk_module_autoinit)
     MODULES ${VTK_LIBRARIES}
   )
 endif()
+
+add_executable(glfw_probe
+  tools/glfw_probe.cpp
+)
+
+target_link_libraries(glfw_probe PRIVATE
+  glfw
+  tracto_glad
+)

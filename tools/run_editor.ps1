@@ -5,6 +5,8 @@ param(
     [int]$DisplayN = 12000,
     [int]$DispStep = 2,
     [switch]$NoFa,
+    [switch]$FrontBuffer,
+    [string]$Screenshot = "",
     [switch]$BuildFirst
 )
 
@@ -39,6 +41,14 @@ if ($NoFa) {
         throw "Missing FA file: $FaPath"
     }
     $ExeArgs = @("--fa", $FaPath) + $ExeArgs
+}
+
+if ($Screenshot -ne "") {
+    $ExeArgs += @("--screenshot", (Join-Path $RepoRoot $Screenshot))
+}
+
+if ($FrontBuffer) {
+    $ExeArgs += "--front-buffer"
 }
 
 & $Exe @ExeArgs

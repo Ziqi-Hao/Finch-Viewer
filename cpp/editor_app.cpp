@@ -20,6 +20,8 @@
 #include <vtkMatrix4x4.h>
 #include <vtkNIFTIImageReader.h>
 #include <vtkObject.h>
+#include <vtkOpenGLRenderWindow.h>
+#include <vtkPNGWriter.h>
 #include <vtkPointData.h>
 #include <vtkPoints.h>
 #include <vtkPolyData.h>
@@ -31,6 +33,13 @@
 #include <vtkTextActor.h>
 #include <vtkTextProperty.h>
 #include <vtkUnsignedCharArray.h>
+#include <vtkWindowToImageFilter.h>
+#include <vtk_glew.h>
+
+#ifdef _WIN32
+#include <vtkWin32OpenGLRenderWindow.h>
+#include <vtkWin32RenderWindowInteractor.h>
+#endif
 
 #ifdef HAVE_OPENMP
 #include <omp.h>
@@ -103,6 +112,59 @@ std::string FormatBounds(const Bounds& bounds) {
 
 double Clamp01(double value) {
   return std::clamp(value, 0.0, 1.0);
+}
+
+void WriteRenderWindowPng(vtkRenderWindow* window, const std::string& path) {
+  vtkSmartPointer<vtkWindowToImageFilter> capture =
+      vtkSmartPointer<vtkWindowToImageFilter>::New();
+  capture->SetInput(window);
+  capture->ReadFrontBufferOff();
+  capture->Update();
+
+  vtkSmartPointer<vtkPNGWriter> writer = vtkSmartPointer<vtkPNGWriter>::New();
+  writer->SetFileName(path.c_str());
+  writer->SetInputConnection(capture->GetOutputPort());
+  writer->Write();
+}
+
+void PrintRenderBackendInfo(vtkRenderWindow* window, vtkRenderWindowInteractor* interactor) {
+  std::cout << "  render window: " << window->GetClassName() << "\n";
+  std::cout << "  interactor   : " << interactor->GetClassName() << "\n";
+  if (auto* glWindow = vtkOpenGLRenderWindow::SafeDownCast(window)) {
+    int major = 0;
+    int minor = 0;
+    glWindow->GetOpenGLVersion(major, minor);
+    std::cout << "  OpenGL       : " << major << "." << minor << "\n";
+    const std::string support = glWindow->GetOpenGLSupportMessage();
+    if (!support.empty()) {
+      std::cout << "  GL support   : " << support << "\n";
+    }
+    if (const char* capabilities = glWindow->ReportCapabilities()) {
+      std::istringstream lines(capabilities);
+      std::string line;
+      int printed = 0;
+      while (printed < 8 && std::getline(lines, line)) {
+        if (line.empty()) {
+          continue;
+        }
+        std::cout << "  GL caps      : " << line << "\n";
+        ++printed;
+      }
+    }
+  }
+}
+
+void ConfigureOpenGLPresent(vtkRenderWindow* window, bool frontBuffer) {
+  window->SetForceMakeCurrent();
+  window->SwapBuffersOn();
+  if (auto* glWindow = vtkOpenGLRenderWindow::SafeDownCast(window)) {
+    if (frontBuffer) {
+      glWindow->SetFrameBlitModeToBlitToCurrent();
+    } else {
+      glWindow->SetFrameBlitModeToBlitToHardware();
+    }
+    glWindow->SetFramebufferFlipY(false);
+  }
 }
 
 }  // namespace
@@ -221,7 +283,7 @@ void EditorApp::RebuildDisplayPolyData(bool render) {
     lineMapper_->Modified();
   }
   if (render && renderWindow_) {
-    renderWindow_->Render();
+    PresentFrame();
   }
 }
 
@@ -309,12 +371,26 @@ void EditorApp::Run() {
   renderer_ = vtkSmartPointer<vtkRenderer>::New();
   renderer_->SetBackground(0.035, 0.035, 0.04);
 
+#ifdef _WIN32
+  renderWindow_ = vtkSmartPointer<vtkWin32OpenGLRenderWindow>::New();
+#else
   renderWindow_ = vtkSmartPointer<vtkRenderWindow>::New();
+#endif
   renderWindow_->SetSize(1280, 900);
   renderWindow_->SetWindowName("SUBG08 OR editor (C++/VTK)");
+  renderWindow_->SetMultiSamples(0);
+  renderWindow_->SetUseSRGBColorSpace(false);
+  ConfigureOpenGLPresent(renderWindow_, args_.frontBuffer);
+  if (!args_.screenshotPath.empty()) {
+    renderWindow_->OffScreenRenderingOn();
+  }
   renderWindow_->AddRenderer(renderer_);
 
+#ifdef _WIN32
+  interactor_ = vtkSmartPointer<vtkWin32RenderWindowInteractor>::New();
+#else
   interactor_ = vtkSmartPointer<vtkRenderWindowInteractor>::New();
+#endif
   interactor_->SetRenderWindow(renderWindow_);
 
   vtkSmartPointer<vtkInteractorStyleTrackballCamera> style =
@@ -385,14 +461,43 @@ void EditorApp::Run() {
   });
   interactor_->AddObserver(vtkCommand::KeyPressEvent, keyCallback);
 
-  RecenterCamera();
+  SetCameraToDataBounds();
 
   std::cout << "\nLaunching viewer ...\n";
   std::cout << "Hint: drag the yellow box handles to position it, then press 'd' or 'k'.\n";
   std::cout << "If the view looks empty, press 'c' or Home to recenter on streamlines.\n";
+  if (args_.frontBuffer) {
+    std::cout << "Display fallback: drawing directly to GL_FRONT (--front-buffer).\n";
+  }
 
   interactor_->Initialize();
-  renderWindow_->Render();
+  interactor_->Enable();
+  PresentFrame();
+  PrintRenderBackendInfo(renderWindow_, interactor_);
+  if (!args_.screenshotPath.empty()) {
+    WriteRenderWindowPng(renderWindow_, args_.screenshotPath);
+    std::cout << "screenshot -> " << args_.screenshotPath << "\n";
+    return;
+  }
+
+  vtkSmartPointer<vtkCallbackCommand> startupRender =
+      vtkSmartPointer<vtkCallbackCommand>::New();
+  startupRender->SetClientData(this);
+  startupRender->SetCallback([](vtkObject*, unsigned long, void* clientData, void*) {
+    auto* app = static_cast<EditorApp*>(clientData);
+    if (app->startupFramesRemaining_ > 0) {
+      --app->startupFramesRemaining_;
+      app->PresentFrame();
+      return;
+    }
+    if (app->interactor_ && app->startupTimerId_ > 0) {
+      app->interactor_->DestroyTimer(app->startupTimerId_);
+      app->startupTimerId_ = 0;
+    }
+  });
+  interactor_->AddObserver(vtkCommand::TimerEvent, startupRender);
+  startupFramesRemaining_ = 40;
+  startupTimerId_ = interactor_->CreateRepeatingTimer(50);
   interactor_->Start();
 }
 
@@ -694,7 +799,7 @@ void EditorApp::ToggleFa() {
   for (auto& actor : faActors_) {
     actor->SetVisibility(showFa_ ? 1 : 0);
   }
-  renderWindow_->Render();
+  PresentFrame();
 }
 
 void EditorApp::PreviewBox() {
@@ -761,6 +866,11 @@ void EditorApp::PrintStats() {
 }
 
 void EditorApp::RecenterCamera() {
+  SetCameraToDataBounds();
+  PresentFrame();
+}
+
+void EditorApp::SetCameraToDataBounds() {
   if (!renderer_) {
     return;
   }
@@ -780,8 +890,31 @@ void EditorApp::RecenterCamera() {
   camera->SetViewUp(0.0, 0.0, 1.0);
   renderer_->ResetCamera(bounds.v);
   renderer_->ResetCameraClippingRange(bounds.v);
-  if (renderWindow_) {
-    renderWindow_->Render();
+}
+
+void EditorApp::PresentFrame() {
+  if (!renderWindow_) {
+    return;
+  }
+
+  ConfigureOpenGLPresent(renderWindow_, args_.frontBuffer);
+  if (args_.frontBuffer) {
+    if (auto* glWindow = vtkOpenGLRenderWindow::SafeDownCast(renderWindow_)) {
+      glWindow->MakeCurrent();
+      glDrawBuffer(GL_FRONT);
+    }
+  }
+  renderWindow_->Render();
+  if (args_.frontBuffer) {
+    if (auto* glWindow = vtkOpenGLRenderWindow::SafeDownCast(renderWindow_)) {
+      glWindow->MakeCurrent();
+      glDrawBuffer(GL_FRONT);
+    }
+    renderWindow_->Frame();
+    glFlush();
+    glFinish();
+  } else if (renderWindow_->GetMapped()) {
+    renderWindow_->Frame();
   }
 }
 
@@ -868,7 +1001,7 @@ void EditorApp::RefreshLines(bool render) {
   }
   UpdateStatus();
   if (render && renderWindow_) {
-    renderWindow_->Render();
+    PresentFrame();
   }
 }
 

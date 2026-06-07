@@ -13,6 +13,8 @@ struct Args {
   int dispStep = 2;
   uint64_t seed = 0;
   bool noFa = false;
+  bool frontBuffer = false;
+  std::string screenshotPath;
 };
 
 void Usage(const char* exe);

@@ -12,13 +12,14 @@ import subprocess
 import threading
 import time
 
-from .render import CornerText
+from .render import CornerText, GOOD, MONO_FONT_FILE
 
 
 class PerfOverlay:
     def __init__(self, plotter):
         self.plotter = plotter
-        self.text = CornerText(plotter, position="upper_left", color="lime", font_size=9)
+        self.text = CornerText(plotter, position="upper_right", color=GOOD,
+                               font_size=9, font_file=MONO_FONT_FILE)
         self._state = {"cpu": "CPU --", "gpu": None, "renderer": None}
         try:
             import psutil

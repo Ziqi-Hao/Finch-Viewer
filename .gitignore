@@ -19,6 +19,13 @@ __pycache__/
 # ── Local Claude Code config (per-machine permission allowlist) ──────────────
 .claude/
 
+# ── Nested reference repo (clone separately; don't vendor it here) ───────────
+dmri-explorer/
+
+# ── Debug / scratch screenshots ──────────────────────────────────────────────
+debug_*.png
+ui_*.png
+
 # ── OS / editor cruft ────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

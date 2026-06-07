@@ -16,18 +16,29 @@ import numpy as np
 import pyvista as pv
 
 
-def _resolve_font():
-    """A clean TTF for HUD text (DejaVuSans ships with matplotlib); None if absent."""
+def _resolve_font(name="DejaVuSans.ttf"):
+    """A clean TTF for HUD text (DejaVu ships with matplotlib); None if absent."""
     try:
         import matplotlib
         p = os.path.join(os.path.dirname(matplotlib.__file__),
-                         "mpl-data", "fonts", "ttf", "DejaVuSans.ttf")
+                         "mpl-data", "fonts", "ttf", name)
         return p if os.path.exists(p) else None
     except Exception:
         return None
 
 
-FONT_FILE = _resolve_font()
+FONT_FILE = _resolve_font("DejaVuSans.ttf")            # UI labels / titles
+MONO_FONT_FILE = _resolve_font("DejaVuSansMono.ttf")   # HUD readouts (aligned numbers)
+
+# ── Theme ────────────────────────────────────────────────────────────────────
+# One cohesive dark palette; tweak here, not scattered through the code.
+BG_BOTTOM = (0.035, 0.045, 0.065)     # deep slate (window gradient bottom)
+BG_TOP = (0.10, 0.12, 0.16)           # slightly lifted slate (gradient top)
+ACCENT = (0.36, 0.82, 0.80)           # teal — title + selection box
+TEXT = (0.86, 0.90, 0.96)             # primary readout text
+TEXT_DIM = (0.55, 0.61, 0.70)         # secondary / hints
+GOOD = (0.50, 0.85, 0.60)             # perf overlay (calm green, not harsh lime)
+BOX = (1.0, 0.78, 0.25)               # selection box outline (warm gold)
 
 
 def direction_rgb(streamline):
@@ -62,11 +73,13 @@ def make_fa_slices(fa):
 class CornerText:
     """A single text actor pinned to a window corner, replaced on update."""
 
-    def __init__(self, plotter, position="lower_left", color="white", font_size=10):
+    def __init__(self, plotter, position="lower_left", color="white", font_size=10,
+                 font_file=FONT_FILE):
         self.plotter = plotter
         self.position = position
         self.color = color
         self.font_size = font_size
+        self.font_file = font_file
         self.actor = None
 
     def set(self, text):
@@ -74,7 +87,7 @@ class CornerText:
             self.plotter.remove_actor(self.actor)
         self.actor = self.plotter.add_text(text, position=self.position,
                                            color=self.color, font_size=self.font_size,
-                                           font_file=FONT_FILE)
+                                           font_file=self.font_file)
 
 
 class LineLayer:

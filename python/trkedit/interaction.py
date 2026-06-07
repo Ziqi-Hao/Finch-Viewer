@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import vtk
 
+from . import render as R
+
 
 def ask_open_file(title="Open file", filetypes=(("All files", "*.*"),)):
     """Native file dialog (tkinter); falls back to a terminal prompt."""
@@ -32,7 +34,7 @@ def setup_interaction(editor):
     editor.box_bounds = init
     # rotation_enabled=False keeps the box axis-aligned (selection uses axis bounds);
     # InteractionEvent fires continuously so highlight tracks the drag.
-    bw = plotter.add_box_widget(callback=editor.on_box, color="yellow",
+    bw = plotter.add_box_widget(callback=editor.on_box, color=R.BOX,
                                 rotation_enabled=False, factor=1.0, bounds=init,
                                 interaction_event=vtk.vtkCommand.InteractionEvent)
     bw.AddObserver(vtk.vtkCommand.EndInteractionEvent,

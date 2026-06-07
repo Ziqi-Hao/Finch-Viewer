@@ -68,6 +68,8 @@ class EditorApp {
   void PreviewBox();
   void PrintStats();
   void RecenterCamera();
+  void PresentFrame();
+  void SetCameraToDataBounds();
   void DensityUp();
   void DensityDown();
   void DensitySet();
@@ -93,6 +95,8 @@ class EditorApp {
   bool showFa_ = true;
   bool hasBox_ = false;
   int displayCap_ = 12000;
+  int startupFramesRemaining_ = 0;
+  int startupTimerId_ = 0;
   Bounds boxBounds_;
 
   std::vector<std::vector<vtkIdType>> displayCells_;

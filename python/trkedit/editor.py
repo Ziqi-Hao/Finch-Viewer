@@ -98,10 +98,8 @@ class Editor:
     def _update_status(self):
         na = int(self.alive.sum())
         self.status.set(
-            f"alive: {na:,}/{self.tg.n:,}    shown: {self.n_shown:,} "
-            f"(cap {self.display_n:,})    [white = inside box]\n"
-            "d=delete  k=keep  p=preview  t=stats  +/-=density  n=set#  l=load  "
-            "u=undo  r=reset  s=save  h=FA  q=quit")
+            f"alive {na:,} / {self.tg.n:,}      shown {self.n_shown:,}  "
+            f"(cap {self.display_n:,})      white = inside box")
 
     # ── edit operations (act on the FULL set) ────────────────────────────────
     def _push(self):
@@ -263,8 +261,9 @@ class Editor:
         print(f"  display cap : {self.display_n:,}  (shown now: {self.n_shown:,})")
         print("──────────────────────────────────────────────────\n")
 
-    # ── run ───────────────────────────────────────────────────────────────────
-    def run(self):
+    # ── build / run ─────────────────────────────────────────────────────────
+    def build(self):
+        """Load data and assemble the scene + widgets (everything but show())."""
         print(f"Loading FA   : {self.args.fa}")
         self.fa = FaVolume.load(self.args.fa)
         print(f"  shape={self.fa.shape}  voxel={self.fa.zooms}")
@@ -276,22 +275,51 @@ class Editor:
             sys.exit("no tractogram loaded")
 
         self.plotter = pv.Plotter(window_size=(1280, 900))
-        self.plotter.set_background("black")
+        self.plotter.set_background(R.BG_BOTTOM, top=R.BG_TOP)
         self.bg_actors = [self._add_fa_slice(s) for s in R.make_fa_slices(self.fa)]
-        self.status = R.CornerText(self.plotter, "lower_left", "white", 10)
+        self.status = R.CornerText(self.plotter, position=(18, 44), color=R.TEXT,
+                                   font_size=10, font_file=R.MONO_FONT_FILE)
         self.line = R.LineLayer(self.plotter, self.tg,
                                 disp_step=self.args.disp_step, seed=self.args.seed)
         I.setup_interaction(self)
         ui.setup_menu(self)
         self._rebuild(reset_camera=True)
+        self._frame_on_tracts()                    # focus on the bundle, not the FA planes
         self.perf = PerfOverlay(self.plotter); self.perf.start()
+        self._add_chrome()
+        try:
+            self.plotter.enable_anti_aliasing("fxaa")   # smoother lines, ~free
+        except Exception:
+            pass
 
+    def run(self):
+        self.build()
         print("\nLaunching viewer ...")
-        print("Hint: position the yellow box (white = selected), then 'd' or 'k'.")
+        print("Hint: position the gold box (white = selected), then 'd' or 'k'.")
         print("Use the on-screen buttons (top-left) to load tracts / FA or save.")
-        self.plotter.show(title="tractography editor (local GPU)")
+        self.plotter.show(title="Finch-Viewer")
 
     def _add_fa_slice(self, mesh):
-        return self.plotter.add_mesh(mesh, cmap="gray", opacity=0.55,
+        return self.plotter.add_mesh(mesh, cmap="gray", opacity=0.45,
                                      show_scalar_bar=False, lighting=False,
                                      reset_camera=False)
+
+    def _frame_on_tracts(self):
+        """Zoom the camera to the streamlines (the FA planes extend well past them)."""
+        if self.line.pd is not None:
+            try:
+                self.plotter.reset_camera(bounds=self.line.pd.bounds)
+            except Exception:
+                self.plotter.reset_camera()
+
+    def _add_chrome(self):
+        """Static window chrome: title + controls hint (drawn once)."""
+        p = self.plotter
+        p.add_text("Finch-Viewer", position=(20, 860), color=R.ACCENT,
+                   font_size=17, font_file=R.FONT_FILE)
+        p.add_text("tractography editor", position=(22, 842), color=R.TEXT_DIM,
+                   font_size=8, font_file=R.FONT_FILE)
+        p.add_text("d delete   k keep   p preview   t stats   +/- density   n set#   "
+                   "l load   u undo   r reset   s save   h FA   q quit",
+                   position=(18, 20), color=R.TEXT_DIM, font_size=9,
+                   font_file=R.MONO_FONT_FILE)
