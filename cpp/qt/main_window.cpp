@@ -249,8 +249,9 @@ void MainWindow::ToggleVolume() {
 }
 
 bool MainWindow::SaveScreenshot(const QString& path) {
-  // GL contents only (lines, cage, FA slices, box). The HUD/panel are separate
-  // QWidgets and are NOT in this image — use window()->grab() for a full capture.
+  // Viewport (RHI) contents only (lines, cage, FA slices, box). The HUD/panel are
+  // separate QWidgets and are NOT in this image — use window()->grab() for a full
+  // capture. QRhiWidget::grabFramebuffer() renders a frame offscreen and returns it.
   const QImage image = viewport_->grabFramebuffer();
   return image.save(path);
 }

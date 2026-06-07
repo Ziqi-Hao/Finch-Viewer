@@ -10,17 +10,24 @@ project(tract_rhi LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Gui GuiPrivate)
+find_package(Qt6 REQUIRED COMPONENTS Gui GuiPrivate Widgets)
 find_package(ZLIB REQUIRED)
 
 set(CORE ${CMAKE_CURRENT_SOURCE_DIR}/../../core)
-add_executable(tract_rhi_probe
-    tract_rhi_probe.cpp
+set(CORE_SRC
     ${CORE}/trk_io.cpp
     ${CORE}/tractogram_store.cpp
     ${CORE}/display_geometry.cpp
     ${CORE}/streamline_ops.cpp
     ${CORE}/nifti_io.cpp
     ${CORE}/utils.cpp)
+
+# Offscreen verify harness (increments 1-3): streamlines + FA + selection box -> PNG.
+add_executable(tract_rhi_probe tract_rhi_probe.cpp ${CORE_SRC})
 target_include_directories(tract_rhi_probe PRIVATE ${CORE})
 target_link_libraries(tract_rhi_probe PRIVATE Qt6::Gui Qt6::GuiPrivate ZLIB::ZLIB)
+
+# Interactive viewport (increment 5): QRhiWidget + orbit camera, same pipelines live.
+add_executable(tract_viewer_rhi tract_viewer_rhi.cpp ${CORE_SRC})
+target_include_directories(tract_viewer_rhi PRIVATE ${CORE})
+target_link_libraries(tract_viewer_rhi PRIVATE Qt6::Gui Qt6::GuiPrivate Qt6::Widgets ZLIB::ZLIB)

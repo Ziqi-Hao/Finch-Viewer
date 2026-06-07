@@ -8,7 +8,6 @@
 
 #include <QApplication>
 #include <QString>
-#include <QSurfaceFormat>
 #include <QTimer>
 
 #include <algorithm>
@@ -55,13 +54,8 @@ QString ParseQtArgs(const QStringList& argv, tracto::Args& args) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  // Ask for a 3.3 core context before any GL widget is created.
-  QSurfaceFormat fmt;
-  fmt.setProfile(QSurfaceFormat::CoreProfile);
-  fmt.setVersion(3, 3);
-  fmt.setDepthBufferSize(24);
-  QSurfaceFormat::setDefaultFormat(fmt);
-
+  // The viewport is a QRhiWidget (Metal on macOS); it configures the graphics
+  // API on the widget itself, so no QSurfaceFormat / GL-context request here.
   QApplication app(argc, argv);
   tracto::ApplyTheme(app);  // dark "pro" theme: Fusion base + palette + QSS
 

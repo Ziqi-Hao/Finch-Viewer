@@ -1,17 +1,19 @@
 #pragma once
 
-// Qt OpenGL viewport: render + interaction only. It owns no tractogram or edit
-// state. The MainWindow hands it a ready-made interleaved [pos.xyz, rgb]
-// GL_LINES buffer (built by display_geometry) and a bounds box; the viewport
-// draws those lines plus a bounds cage under an orbit camera. Keeping data and
-// editing out of here preserves the module boundary from CLAUDE.md.
+// Qt RHI (QRhiWidget, Metal on macOS) viewport: render + interaction only. It
+// owns no tractogram or edit state. The MainWindow hands it a ready-made
+// interleaved [pos.xyz, rgb] line buffer (built by display_geometry) and a
+// bounds box; the viewport draws those lines plus a yellow bounds cage, the
+// FA background slices, and the cyan selection box/handles under an orbit
+// camera. Keeping data and editing out of here preserves the module boundary
+// from CLAUDE.md. The renderer-agnostic camera math (WorldToScreen, handle
+// pick/drag) is shared with the old GL viewport and unchanged.
 
 #include "bounds.hpp"
 #include "nifti_io.hpp"
 #include "render_math.hpp"
 
-#include <QOpenGLFunctions_3_3_Core>
-#include <QOpenGLWidget>
+#include <QRhiWidget>
 #include <QPoint>
 #include <QPointF>
 
@@ -19,20 +21,29 @@
 #include <cstddef>
 #include <vector>
 
+// Forward-declare the RHI types so the header stays free of <rhi/qrhi.h> (which
+// needs Qt6::GuiPrivate). Definitions are only needed in the .cpp.
+class QRhi;
+class QRhiBuffer;
+class QRhiTexture;
+class QRhiSampler;
+class QRhiShaderResourceBindings;
+class QRhiGraphicsPipeline;
+
 namespace tracto {
 
-class TractViewport : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core {
+class TractViewport : public QRhiWidget {
   Q_OBJECT
  public:
   explicit TractViewport(QWidget* parent = nullptr);
   ~TractViewport() override;
 
   // Replace the line buffer and frame the camera to `bounds`. Safe to call
-  // before the GL context exists: the upload is deferred to the next paint.
+  // before the rhi exists: the upload is deferred to the next render().
   void SetLineGeometry(std::vector<float> interleaved, const Bounds& bounds);
 
   // Set the scalar background volume (uploaded once as a 3D texture; three mid
-  // slices are rendered as affine-placed quads). Safe before the GL context.
+  // slices are rendered as affine-placed quads). Safe before the rhi exists.
   // By value + move so the caller's multi-MB voxel array is not copied.
   void SetVolume(Volume volume);
   void SetVolumeVisible(bool visible);
@@ -49,9 +60,10 @@ class TractViewport : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core 
   void ResetCamera();
 
  protected:
-  void initializeGL() override;
-  void paintGL() override;
-  void resizeGL(int w, int h) override;
+  // QRhiWidget lifecycle (replaces initializeGL/paintGL/resizeGL; resize implicit).
+  void initialize(QRhiCommandBuffer* cb) override;
+  void render(QRhiCommandBuffer* cb) override;
+  void releaseResources() override;
 
   void mousePressEvent(QMouseEvent* event) override;
   void mouseMoveEvent(QMouseEvent* event) override;
@@ -60,9 +72,9 @@ class TractViewport : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core 
   void keyPressEvent(QKeyEvent* event) override;
 
  private:
-  void UploadGeometry();      // (re)fill the line VBO from lineData_
-  void RebuildCage();         // yellow bounding cage from bounds_
-  void UploadVolume();        // 3D texture + slice quads from pendingVolume_
+  void CreateResources();   // build pipelines/buffers/textures once per rhi device
+  void ReleaseAll();        // destroy all RHI resources (device loss / teardown)
+  void RebuildCage();       // yellow bounding cage from bounds_ (CPU staging only)
 
   // Selection box: geometry, placement, and screen-space handle interaction.
   void RebuildSelectionGeometry();              // wireframe + 7 handle points
@@ -77,58 +89,72 @@ class TractViewport : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core 
   OrbitCamera camera_;
   Bounds bounds_;
 
-  std::vector<float> lineData_;   // [x,y,z,r,g,b] * vertices
-  std::vector<float> cageData_;   // [x,y,z,r,g,b] * vertices (GL_LINES)
+  // CPU-side staging. The dirty flags defer every GPU upload to render() so the
+  // setters stay safe to call before the rhi exists and never need makeCurrent.
+  std::vector<float> lineData_;   // [x,y,z,r,g,b] * vertices (Lines)
+  std::vector<float> cageData_;   // yellow cage, same layout (Lines)
   bool lineDirty_ = false;
+  bool cageDirty_ = false;
 
-  // Line/cage program (pos + rgb).
-  unsigned int program_ = 0;
-  int mvpLoc_ = -1;
-  unsigned int lineVao_ = 0;
-  unsigned int lineVbo_ = 0;
-  unsigned int cageVao_ = 0;
-  unsigned int cageVbo_ = 0;
-  std::size_t lineVertexCount_ = 0;
-  std::size_t cageVertexCount_ = 0;
-
-  // volume slice program (samples a 3D texture; voxel-space quads).
-  Volume pendingVolume_;          // staged until the GL context exists
-  bool volumeDirty_ = false;
+  // Volume slices (3D texture sampled in the fragment shader; voxel-space quads).
+  Volume pendingVolume_;          // staged until the rhi exists; cleared after upload
+  std::vector<float> sliceData_;  // [x,y,z] voxel-coord quad vertices (Triangles)
+  bool volumeDirty_ = false;      // re-upload the 3D texture + slice quads
   bool hasVolume_ = false;
   bool showVolume_ = true;
-  unsigned int sliceProgram_ = 0;
-  int sliceMvpLoc_ = -1;
-  int sliceVoxToWorldLoc_ = -1;
-  int sliceInvDimsLoc_ = -1;
-  int sliceValueMinLoc_ = -1;
-  int sliceValueRangeLoc_ = -1;
-  unsigned int volTexture_ = 0;
-  unsigned int sliceVao_ = 0;
-  unsigned int sliceVbo_ = 0;
-  std::size_t sliceVertexCount_ = 0;
   Mat4 voxToWorld_;
   Vec3 invDims_{1.0f, 1.0f, 1.0f};
   float volValueMin_ = 0.0f;
   float volValueRange_ = 1.0f;
+  int volDims_[3] = {0, 0, 0};
 
-  // Selection box (pos+rgb wireframe + GL_POINTS handles, drawn with program_).
+  // Selection box (cyan wireframe + handle points).
   Bounds boxBounds_;
   bool hasBox_ = false;
-  std::vector<float> boxData_;     // staged wireframe vertices
-  std::vector<float> handleData_;  // staged handle-point vertices
-  bool boxGeomDirty_ = false;      // upload deferred to paintGL (no per-drag makeCurrent)
-  unsigned int boxVao_ = 0;
-  unsigned int boxVbo_ = 0;
-  unsigned int handleVao_ = 0;
-  unsigned int handleVbo_ = 0;
-  std::size_t boxVertexCount_ = 0;
-  std::size_t handleVertexCount_ = 0;
-  int pointSizeLoc_ = -1;
-  int activeHandle_ = -1;  // -1 none; 0 center; 1..6 face handles (axis*2+side+1)
+  std::vector<float> boxData_;     // staged wireframe vertices (Lines)
+  std::vector<float> handleData_;  // staged handle-point vertices (Points)
+  bool boxDirty_ = false;          // re-upload box + handle vertex buffers
+  int activeHandle_ = -1;          // -1 none; 0 center; 1..6 face handles (axis*2+side+1)
 
   QPoint lastPos_;
   bool rotating_ = false;
   bool panning_ = false;
+
+  // ── RHI resources (owned; recreated on device loss). ──────────────────────
+  QRhi* rhi_ = nullptr;
+
+  // Line/cage/box share the line pipeline (Lines topology, [pos,rgb] layout).
+  QRhiBuffer* lineVbo_ = nullptr;
+  QRhiBuffer* cageVbo_ = nullptr;
+  QRhiBuffer* boxVbo_ = nullptr;
+  QRhiBuffer* handleVbo_ = nullptr;
+  QRhiBuffer* lineUbo_ = nullptr;    // mat4 mvp
+  QRhiBuffer* pointUbo_ = nullptr;   // mat4 mvp + vec4 params (point size)
+  QRhiBuffer* sliceVbo_ = nullptr;
+  QRhiBuffer* sliceUbo_ = nullptr;   // mvp + voxToWorld + invDims + valueParams
+  QRhiTexture* volTex_ = nullptr;
+  QRhiSampler* sampler_ = nullptr;
+  QRhiShaderResourceBindings* lineSrb_ = nullptr;
+  QRhiShaderResourceBindings* pointSrb_ = nullptr;
+  QRhiShaderResourceBindings* sliceSrb_ = nullptr;
+  QRhiGraphicsPipeline* linePs_ = nullptr;   // Lines, depth test+write
+  QRhiGraphicsPipeline* pointPs_ = nullptr;  // Points, no depth (handles on top)
+  QRhiGraphicsPipeline* slicePs_ = nullptr;  // Triangles, alpha blend, depth no-write
+
+  // Capacities currently allocated on the GPU; a grow re-creates the buffer.
+  std::size_t lineVboCap_ = 0;
+  std::size_t cageVboCap_ = 0;
+  std::size_t boxVboCap_ = 0;
+  std::size_t handleVboCap_ = 0;
+  std::size_t sliceVboCap_ = 0;
+
+  std::size_t lineVertexCount_ = 0;
+  std::size_t cageVertexCount_ = 0;
+  std::size_t boxVertexCount_ = 0;
+  std::size_t handleVertexCount_ = 0;
+  std::size_t sliceVertexCount_ = 0;
+
+  bool volTexUploaded_ = false;   // the 3D texture matches volTex_ dims + content
 };
 
 }  // namespace tracto

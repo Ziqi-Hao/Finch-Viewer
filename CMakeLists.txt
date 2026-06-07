@@ -67,11 +67,57 @@ if(WIN32)
   target_link_libraries(local_editor_glfw PRIVATE gdi32)
 endif()
 
-# ── Qt/OpenGL editor (the primary editor; no VTK, no glfw/glad) ──────────────
-# Optional: builds only when Qt6 is found, so the project still configures
-# without Qt installed.
-find_package(Qt6 QUIET COMPONENTS Widgets OpenGL OpenGLWidgets)
+# ── Qt RHI editor (the primary editor; no VTK, no glfw/glad) ─────────────────
+# The viewport is a QRhiWidget (Metal on macOS), so we need Qt6::GuiPrivate for
+# <rhi/qrhi.h>; OpenGL/OpenGLWidgets are no longer used. Optional: builds only
+# when Qt6 is found, so the project still configures without Qt installed.
+find_package(Qt6 QUIET COMPONENTS Gui Widgets GuiPrivate)
 if(Qt6_FOUND)
+  # ── Step 0: compile the RHI shaders (.vert/.frag) to .qsb, then embed them in
+  # a generated .qrc so the viewport can load ":/shaders/<name>.qsb". qsb is
+  # located via find_program (don't rely on a manual qsb step).
+  find_program(QSB_EXECUTABLE NAMES qsb
+    HINTS /opt/homebrew/opt/qtshadertools/bin
+          ${Qt6_DIR}/../../../bin
+          ${Qt6_DIR}/../../../libexec)
+  if(NOT QSB_EXECUTABLE)
+    message(FATAL_ERROR "qsb not found (needed to build local_editor_qt shaders). "
+                        "Install qtshadertools or set QSB_EXECUTABLE.")
+  endif()
+
+  set(QT_RHI_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cpp/qt/rhi)
+  set(QT_RHI_SHADERS line.vert line.frag point.vert slice.vert slice.frag)
+  set(QT_RHI_QSB_DIR ${CMAKE_CURRENT_BINARY_DIR}/qt_shaders)
+  file(MAKE_DIRECTORY ${QT_RHI_QSB_DIR})
+
+  set(QT_RHI_QSB_FILES "")
+  foreach(shader ${QT_RHI_SHADERS})
+    set(src ${QT_RHI_SHADER_DIR}/${shader})
+    set(out ${QT_RHI_QSB_DIR}/${shader}.qsb)
+    add_custom_command(
+      OUTPUT ${out}
+      COMMAND ${QSB_EXECUTABLE} --glsl 430 --msl 12 -o ${out} ${src}
+      DEPENDS ${src}
+      COMMENT "qsb ${shader} -> ${shader}.qsb"
+      VERBATIM)
+    list(APPEND QT_RHI_QSB_FILES ${out})
+  endforeach()
+
+  # Generate a .qrc that embeds the .qsb files under the :/shaders/ prefix. The
+  # .qsb live in the binary dir, so the .qrc uses their absolute paths.
+  set(QT_RHI_QRC ${QT_RHI_QSB_DIR}/qt_shaders.qrc)
+  set(QRC_BODY "<RCC>\n  <qresource prefix=\"/shaders\">\n")
+  foreach(shader ${QT_RHI_SHADERS})
+    string(APPEND QRC_BODY
+      "    <file alias=\"${shader}.qsb\">${QT_RHI_QSB_DIR}/${shader}.qsb</file>\n")
+  endforeach()
+  string(APPEND QRC_BODY "  </qresource>\n</RCC>\n")
+  file(GENERATE OUTPUT ${QT_RHI_QRC} CONTENT "${QRC_BODY}")
+
+  # Drive the qsb custom commands from a target the executable depends on, so the
+  # .qsb are produced before AUTORCC reads the .qrc.
+  add_custom_target(qt_rhi_shaders DEPENDS ${QT_RHI_QSB_FILES})
+
   add_executable(local_editor_qt
     cpp/qt/main.cpp
     cpp/qt/main_window.cpp
@@ -80,13 +126,16 @@ if(Qt6_FOUND)
     cpp/qt/viewport_hud.cpp
     cpp/qt/properties_panel.cpp
     cpp/qt/scene_panel.cpp
+    ${QT_RHI_QRC}
   )
-  set_target_properties(local_editor_qt PROPERTIES AUTOMOC ON)
+  add_dependencies(local_editor_qt qt_rhi_shaders)
+  set_source_files_properties(${QT_RHI_QRC} PROPERTIES GENERATED TRUE)
+  set_target_properties(local_editor_qt PROPERTIES AUTOMOC ON AUTORCC ON)
   target_link_libraries(local_editor_qt PRIVATE
     tracto_core
+    Qt6::Gui
     Qt6::Widgets
-    Qt6::OpenGL
-    Qt6::OpenGLWidgets
+    Qt6::GuiPrivate
   )
 else()
   message(STATUS "Qt6 not found: skipping local_editor_qt target")
