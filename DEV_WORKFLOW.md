@@ -51,6 +51,29 @@ You can also pass display decimation:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\run_editor.ps1 -DisplayN 16000 -DispStep 3
 ```
 
+## Run GLFW Viewer
+
+The GLFW/OpenGL viewer uses the same data/IO modules but bypasses VTK's Win32
+render window path.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\run_glfw_editor.ps1
+```
+
+For a lighter smoke test:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\run_glfw_editor.ps1 -DisplayN 300 -DispStep 8
+```
+
+Controls:
+
+- left drag: rotate
+- right or middle drag: pan
+- mouse wheel: zoom
+- `r`: reset camera
+- `Esc`: quit
+
 ## Codex Rule
 
 For this repo, prefer these script entry points over raw ad-hoc commands.

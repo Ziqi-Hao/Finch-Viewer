@@ -109,6 +109,7 @@ VTK scene and drawable geometry.
 Current location:
 
 - mostly `cpp/editor_app.*`
+- GLFW/OpenGL proof path: `cpp/glfw_tract_viewer.*`
 
 Target split:
 
@@ -120,6 +121,9 @@ Target split:
 GPU priorities:
 
 - Keep streamline geometry in VTK `vtkPolyData`/OpenGL buffers.
+- Prefer the GLFW/OpenGL route if VTK's Win32 onscreen present path remains
+  unreliable; this matches `dmri-explorer` and gives us direct VBO/shader
+  control.
 - Avoid rebuilding all geometry for small visibility changes where possible.
 - Rebuild sampled display geometry only when alive mask or display cap changes.
 - Later: use cell visibility arrays, mapper selection, or multiple actors for

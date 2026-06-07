@@ -76,3 +76,26 @@ target_link_libraries(glfw_probe PRIVATE
   glfw
   tracto_glad
 )
+
+add_executable(local_editor_glfw
+  local_editor_glfw.cpp
+  cpp/args.cpp
+  cpp/glfw_tract_viewer.cpp
+  cpp/streamline_ops.cpp
+  cpp/tractogram_store.cpp
+  cpp/trk_io.cpp
+  cpp/utils.cpp
+)
+
+target_include_directories(local_editor_glfw PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp
+)
+
+target_link_libraries(local_editor_glfw PRIVATE
+  glfw
+  tracto_glad
+)
+
+if(WIN32)
+  target_link_libraries(local_editor_glfw PRIVATE gdi32)
+endif()

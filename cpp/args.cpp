@@ -16,6 +16,7 @@ void Usage(const char* exe) {
       << "  --seed N        deterministic display subsampling seed, default 0\n"
       << "  --no-fa         start without FA slices, useful for display debugging\n"
       << "  --front-buffer  draw directly to the front buffer for display debugging\n"
+      << "  --gdi-blit      display OpenGL frames through Win32 GDI fallback\n"
       << "  --screenshot P  render one frame to PNG and exit\n"
       << "  --help          show this help\n";
 }
@@ -47,6 +48,8 @@ Args ParseArgs(int argc, char** argv) {
       args.noFa = true;
     } else if (key == "--front-buffer") {
       args.frontBuffer = true;
+    } else if (key == "--gdi-blit") {
+      args.gdiBlit = true;
     } else if (key == "--screenshot") {
       args.screenshotPath = requireValue(key);
     } else if (key == "--help" || key == "-h") {

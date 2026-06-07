@@ -14,6 +14,7 @@ struct Args {
   uint64_t seed = 0;
   bool noFa = false;
   bool frontBuffer = false;
+  bool gdiBlit = false;
   std::string screenshotPath;
 };
 
