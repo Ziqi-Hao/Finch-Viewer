@@ -1,0 +1,10 @@
+# Finch-Viewer (Python editor) dependencies.
+# NOTE: needs an on-screen VTK build (the PyPI wheel), not a headless EGL/OSMesa one.
+numpy
+pyvista
+vtk
+dipy
+nibabel
+scipy
+psutil
+matplotlib
