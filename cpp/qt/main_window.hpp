@@ -63,22 +63,29 @@ class MainWindow : public QMainWindow {
   struct VolumeLayer {
     Volume vol; QString name; int id = 0; bool isLabel = false;
     float winLo = 0.0f, winHi = 1.0f;   // grayscale window (contrast), per volume
+    float opacity = 1.0f;               // layer opacity (0..1)
     std::vector<float> histBins;        // precomputed display histogram
     float dispMin = 0.0f, dispMax = 1.0f;  // adaptive intensity axis (robust max)
+    std::vector<float> lut;             // label mode: RGBA per label index
+    int lutWidth = 0;                   // label mode: number of label entries
   };
 
-  void RebuildDisplay();   // full-set alive mask -> sampled GPU line buffer
+  void RebuildDisplay();   // active full-set alive mask -> sampled GPU line buffer
+  void RebuildTractOverlays();  // visible non-active bundles -> read-only viewport overlays
+  void RebuildDensityMap();     // active tractogram -> track-density heatmap in the 2-D panes
   void UpdateStatus();
   void RefreshStats();             // compute BasicStats -> Properties panel
   void PollSelectionReadout();     // mirror the viewport box into the panel when it moves
   void SetEditMode(bool on);       // View (default) <-> Edit: gates box + edit tools/cards
   void OnLayerVisibility(int id, bool on);  // a layer checkbox toggled in the Layers panel
+  void OnLayerOpacity(int id, double opacity);  // a layer opacity slider moved
   void ActivateTracts(int index);           // archive the active TRK, swap in tracts_[index]
   bool AnyTractsDirty() const;              // any loaded tractogram with unsaved edits
   void LoadVolumeLayer(const QString& path, bool isLabel);  // shared volume/label loader
   void UpdateInfo();                        // refresh the Properties basic-info readout
   void UpdateHistogram();                   // active volume -> Contrast histogram + window
   void ComputeHistogram(VolumeLayer& vl);   // bins + adaptive (robust) intensity range
+  void ComputeLabelLut(VolumeLayer& vl);    // integer label -> per-label RGBA colour table
   void PushHistory();      // snapshot aliveFull_ for undo (bounded depth)
   std::size_t CountInBox(const std::vector<uint8_t>& inBox) const;  // alive & in box
   // Modal dialog when interactive; stderr in headless --screenshot runs (a modal
@@ -99,7 +106,9 @@ class MainWindow : public QMainWindow {
   bool hasTracts_ = false;
   bool tractsDirty_ = false;        // unsaved edits to the active tractogram
 
-  // Loaded tractograms (load many; one active at a time, archive-swapped).
+  // Loaded tractograms (load many; render several at once. One is "active" —
+  // editable, archive-swapped into store_/aliveFull_; the rest are read-only
+  // overlays in the viewport).
   struct TractBundle {
     TractogramStore store;
     std::vector<uint8_t> alive;
@@ -109,9 +118,21 @@ class MainWindow : public QMainWindow {
     QString path;   // source path (for the HUD + save default)
     int id = 0;     // Layers-panel row id
     bool dirty = false;
+    bool visible = true;  // checkbox state (drawn = active lines or an overlay)
+    // Cached display geometry for when this bundle is a non-active overlay: built
+    // when it's archived (from its full SoA), so its SoA can then be slimmed and
+    // the overlay still draws without a rebuild. Empty while active or hidden.
+    std::vector<float> overlayVerts;
+    // Track-density map, computed ONCE from the full original streamlines at load
+    // and reused thereafter (it does not track edits or the display-density slider).
+    Volume densityMap;
   };
   std::vector<TractBundle> tracts_;
   int activeTracts_ = -1;
+  // Reserved viewport image id for the auto-generated track-density map (the 2-D
+  // slice panes show it instead of the streamlines). Negative so it can't collide
+  // with a Layers-panel row id.
+  static constexpr int kDensityLayerId = -1000;
   TractViewport* viewport_ = nullptr;
   ViewportHud* hud_ = nullptr;            // translucent counts overlay over the viewport
   PropertiesPanel* properties_ = nullptr; // right-dock inspector
@@ -120,11 +141,11 @@ class MainWindow : public QMainWindow {
   QAction* editAct_ = nullptr;            // checkable View/Edit toggle
   std::vector<QAction*> editTools_;        // actions enabled only in edit mode
 
-  // Loaded volume layers (Freeview/FSLeyes-style: load many, pick which to view).
-  // The viewport renders one volume at a time, so checking a volume makes it the
-  // active one (others auto-uncheck); multi-volume blending is a later stage.
+  // Loaded volume/label layers (Freeview/FSLeyes-style: load many, blend the
+  // visible ones). Every checked layer renders; `selectedVolumeId_` is just the
+  // one whose histogram/window the Contrast panel currently edits.
   std::vector<VolumeLayer> volumes_;
-  int activeVolumeId_ = -1;
+  int selectedVolumeId_ = -1;
 
   Bounds lastBox_{};                      // last box mirrored into the panel (change detection)
   int boxStableTicks_ = 0;                // debounce: scan only after the box stops moving

@@ -1,14 +1,15 @@
 #pragma once
 
 // Left-dock Layers panel (Freeview / FSLeyes style): every loaded file is a row
-// with a visibility checkbox, grouped into Volume / Tracts / Label. Load as many
-// as you like; check to show, uncheck to hide. A passive view — it emits
-// visibilityChanged(id, on) and is driven by MainWindow, which owns the data.
+// with a visibility checkbox, grouped into Volume / Tracts / Label. Volume and
+// label rows also expose opacity because the viewport can fade those layers now.
+// Tract rows stay visibility-only until the renderer supports tract alpha.
 
 #include <QHash>
 #include <QWidget>
 
 class QCheckBox;
+class QSlider;
 class QVBoxLayout;
 
 namespace tracto {
@@ -21,15 +22,18 @@ class LayersPanel : public QWidget {
   explicit LayersPanel(QWidget* parent = nullptr);
 
   int AddLayer(Kind kind, const QString& name, bool visible);  // returns a layer id
-  void SetVisible(int id, bool on);  // set a checkbox without emitting (sync from code)
+  void SetVisible(int id, bool on);        // set the checkbox without emitting
+  void SetOpacity(int id, double opacity);  // set the slider (0..1) without emitting
   void RemoveLayer(int id);
 
  signals:
   void visibilityChanged(int id, bool on);
+  void opacityChanged(int id, double opacity);  // 0..1
 
  private:
+  struct Row { QWidget* widget; QCheckBox* check; QSlider* slider; };
   QVBoxLayout* groupLayout_[3] = {nullptr, nullptr, nullptr};  // per Kind
-  QHash<int, QCheckBox*> checks_;
+  QHash<int, Row> rows_;
   int nextId_ = 1;
 };
 

@@ -10,11 +10,11 @@
 
 namespace tracto {
 
-bool StreamlineInBounds(const Streamline& sl, const Bounds& b);
+// Direction RGB for a polyline point (|tangent| components), from a packed
+// [x,y,z]* buffer. The display builders colour their decimated lines with this.
 std::array<unsigned char, 3> DirectionRgbFromPoints(const float* points,
                                                     std::size_t pointCount,
                                                     std::size_t pointIndex);
-std::array<unsigned char, 3> DirectionRgb(const Streamline& sl, int32_t i);
 std::vector<int> MakeDisplayIndices(int fullCount, int displayN, uint64_t seed);
 std::vector<int> MakeDisplayIndicesFromAlive(const std::vector<uint8_t>& alive,
                                              int displayN,

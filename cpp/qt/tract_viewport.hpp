@@ -43,23 +43,37 @@ class TractViewport : public QRhiWidget {
   ~TractViewport() override;
 
   // Replace the line buffer (+ per-streamline spans, for the in-box highlight).
-  // Safe before the rhi exists: the upload is deferred to the next render().
+  // This is the ACTIVE (editable) tractogram — the one with the selection box and
+  // highlight. Safe before the rhi exists: the upload is deferred to render().
   void SetLineGeometry(std::vector<float> interleaved, std::vector<DisplaySpan> spans,
                        const Bounds& bounds);
+
+  // Replace the read-only overlay tractograms (the other visible-but-not-active
+  // bundles), each an interleaved [pos.xyz, rgb] line buffer like SetLineGeometry.
+  // Drawn alongside the active one so several tractograms can show at once.
+  void SetTractOverlays(std::vector<std::vector<float>> overlays);
 
   // Provide a full-set in-box query (MainWindow binds its selection backend).
   // Drives the live white highlight of the streamlines inside the box.
   void SetSelectionQuery(std::function<std::vector<uint8_t>(const Bounds&)> query);
 
-  // Set the scalar background volume (uploaded once as a 3D texture; three mid
-  // slices are rendered as affine-placed quads). Safe before the rhi exists.
-  // By value + move so the caller's multi-MB voxel array is not copied.
-  void SetVolume(Volume volume);
-  void SetVolumeVisible(bool visible);
+  // Multi-image background. Each loaded volume/label is an independent slice
+  // layer (its own 3D texture, window/opacity, and grayscale-or-label mode),
+  // keyed by `id`; the slice panes blend every visible layer back-to-front
+  // (non-label volumes underneath, labels on top). Keying by id keeps cheap
+  // window/opacity tweaks off the texture-upload path. Safe before the rhi
+  // exists (uploads defer to render). `lut` is RGBA per label index (label mode).
+  void SetImage(int id, Volume vol, bool isLabel, std::vector<float> lut, int lutWidth);
+  void SetImageParams(int id, float winLo, float winHi, float opacity);  // cheap: UBO only
+  void SetImageVisible(int id, bool visible);
+  void SetImageHeatmap(int id, bool on);    // render via the "hot" density colour ramp
+  void SetImageOrthoOnly(int id, bool on);  // draw only in the 2-D slice panes (not the 3-D pane)
+  void RemoveImage(int id);
+
+  void SetVolumeVisible(bool visible);  // global master switch for all slice layers
   bool VolumeVisible() const { return showVolume_; }
   void SetTractsVisible(bool visible);  // hide/show the streamline layer
   bool TractsVisible() const { return showTracts_; }
-  void SetVolumeRange(float lo, float hi);  // grayscale window (contrast) of the active volume
 
   // Edit mode is opt-in: in view mode (default) no cage / selection box / handles
   // are drawn and left-drag always orbits. The selection box + box editing only
@@ -98,10 +112,16 @@ class TractViewport : public QRhiWidget {
   void keyPressEvent(QKeyEvent* event) override;
 
  private:
+  struct ImageSlot;         // one background image layer (defined below)
+
   void CreateResources();   // build pipelines/buffers/textures once per rhi device
   void ReleaseAll();        // destroy all RHI resources (device loss / teardown)
   void RebuildCage();       // yellow bounding cage from bounds_ (CPU staging only)
-  void RebuildSliceQuads(); // build the 3 slice quads at the current focus voxel
+  void RebuildSliceQuads(ImageSlot& s);  // build s's 3 slice quads at the current focus
+  void RebuildSliceSrb(ImageSlot& s);    // (re)bind s's SRB: UBO(dyn) + s.tex + s.lutTex
+  ImageSlot* FindImage(int id);          // slot with this id, or nullptr
+  void RecomputeDrawOrder();             // refill drawOrder_ (non-labels first, labels last)
+  void RecomputeVolumeBounds();          // volumeBounds_ + scrub step from the primary image
   void UpdateHighlight();   // gather in-box displayed streamlines into white overlay
 
   // Selection box: geometry, placement, and screen-space handle interaction.
@@ -156,21 +176,58 @@ class TractViewport : public QRhiWidget {
   QElapsedTimer highlightClock_;           // throttles the recompute during a drag
   qint64 lastHighlightMs_ = -1000;
 
-  // Volume slices (3D texture sampled in the fragment shader; voxel-space quads).
-  Volume pendingVolume_;          // staged until the rhi exists; cleared after upload
-  std::vector<float> sliceData_;  // [x,y,z] voxel-coord quad vertices (Triangles)
-  bool volumeDirty_ = false;      // re-upload the 3D texture + slice quads
-  bool hasVolume_ = false;
-  bool showVolume_ = true;
+  // Read-only overlay tractograms (visible bundles other than the active one).
+  // Each is a static [pos.xyz, rgb] line buffer drawn with the line pipeline; no
+  // spans/highlight (only the active bundle is editable). Replaced wholesale.
+  struct TractOverlay {
+    std::vector<float> data;        // [x,y,z,r,g,b] * vertices (Lines)
+    QRhiBuffer* vbo = nullptr;
+    std::size_t cap = 0, vertexCount = 0;
+    bool dirty = false;             // re-upload in the next render()
+  };
+  std::vector<TractOverlay> overlays_;
+
+  // ── Background image layers (multi-image blend). ──────────────────────────
+  // Each loaded volume/label is one ImageSlot: its own 3D texture, slice quads,
+  // window/opacity, and grayscale-or-label mode. The slice panes blend every
+  // visible slot back-to-front (non-label volumes first, labels on top), so
+  // several segmentations can overlay one anatomy. The CPU-side Volume + lut are
+  // retained so RHI device loss can re-upload the textures.
+  struct ImageSlot {
+    int id = -1;
+    bool visible = true;
+    // Display params (cheap to change; pushed straight into the per-frame UBO).
+    float valueMin = 0.0f, valueRange = 1.0f, opacity = 1.0f;
+    bool isLabel = false;
+    bool heatmap = false;    // density "hot" colour ramp (slice shader mode 2)
+    bool orthoOnly = false;  // draw only in the 2-D slice panes, not the 3-D pane
+    int lutWidth = 1;
+    // Source data + derived placement (slice quads live in this image's voxel space).
+    Volume vol;
+    std::vector<float> lut;        // label mode: RGBA per label index
+    Mat4 voxToWorld, worldToVox;
+    Vec3 invDims{1.0f, 1.0f, 1.0f};
+    float voxelSpacing[3] = {1.0f, 1.0f, 1.0f};
+    int dims[3] = {0, 0, 0};
+    std::vector<float> sliceData;  // [x,y,z] voxel-coord quad vertices (Triangles)
+    // GPU resources (owned; recreated on device loss). Each slot binds its own
+    // texture into a layout-compatible SRB (the slice pipeline's template SRB).
+    QRhiTexture* tex = nullptr;
+    QRhiTexture* lutTex = nullptr;
+    QRhiBuffer* sliceVbo = nullptr;
+    QRhiShaderResourceBindings* srb = nullptr;
+    std::size_t sliceVboCap = 0, sliceVertexCount = 0;
+    bool texDirty = false;    // (re)create + upload tex, then rebuild srb + lut
+    bool lutDirty = false;    // (re)create + upload lutTex, rebuild srb
+    bool quadsDirty = false;  // rebuild + upload slice quads at the current focus
+  };
+  static constexpr int kMaxBlendImages = 8;  // simultaneously-blended layers (UBO sizing)
+  std::vector<ImageSlot> images_;
+  std::vector<int> drawOrder_;   // indices into images_, non-labels first then labels
+  bool focusDirty_ = false;      // focus moved -> rebuild every slot's slice quads
+  bool showVolume_ = true;       // global master switch for all slice layers
   bool showTracts_ = true;
-  Mat4 voxToWorld_;
-  Mat4 worldToVox_;                 // inverse of voxToWorld_ (focus world -> voxel index)
-  float voxelSpacing_[3] = {1.0f, 1.0f, 1.0f};  // world mm per voxel along each volume axis
-  bool sliceQuadsDirty_ = false;    // rebuild the slice quads at the current focus
-  Vec3 invDims_{1.0f, 1.0f, 1.0f};
-  float volValueMin_ = 0.0f;
-  float volValueRange_ = 1.0f;
-  int volDims_[3] = {0, 0, 0};
+  float sliceScrubStep_[3] = {1.0f, 1.0f, 1.0f};  // world mm/voxel of the primary image
 
   // Selection box (cyan wireframe + handle points).
   Bounds boxBounds_;
@@ -196,13 +253,18 @@ class TractViewport : public QRhiWidget {
   QRhiBuffer* highlightVbo_ = nullptr;
   QRhiBuffer* lineUbo_ = nullptr;    // mat4 mvp
   QRhiBuffer* pointUbo_ = nullptr;   // mat4 mvp + vec4 params (point size)
-  QRhiBuffer* sliceVbo_ = nullptr;
-  QRhiBuffer* sliceUbo_ = nullptr;   // mvp + voxToWorld + invDims + valueParams
-  QRhiTexture* volTex_ = nullptr;
-  QRhiSampler* sampler_ = nullptr;
+  // Slice UBO holds kMaxBlendImages*4 blocks (one per image×pane), bound per draw
+  // via a dynamic offset. volTex_/lutTex_/sliceSrb_ are 1x1 placeholders that
+  // exist only so the slice pipeline has a layout-compatible SRB at creation; the
+  // real per-image textures live in each ImageSlot.
+  QRhiBuffer* sliceUbo_ = nullptr;   // mvp + voxToWorld + invDims + valueParams (per image×pane)
+  QRhiTexture* volTex_ = nullptr;        // 1x1 placeholder (template SRB only)
+  QRhiTexture* lutTex_ = nullptr;        // 1x1 placeholder (template SRB only)
+  QRhiSampler* sampler_ = nullptr;       // linear (grayscale volumes)
+  QRhiSampler* nearestSampler_ = nullptr;  // nearest (labels + LUT)
   QRhiShaderResourceBindings* lineSrb_ = nullptr;
   QRhiShaderResourceBindings* pointSrb_ = nullptr;
-  QRhiShaderResourceBindings* sliceSrb_ = nullptr;
+  QRhiShaderResourceBindings* sliceSrb_ = nullptr;  // template (layout) for slicePs_
   QRhiGraphicsPipeline* linePs_ = nullptr;   // Lines, depth test+write
   QRhiGraphicsPipeline* highlightPs_ = nullptr;  // Lines, no depth (white selection on top)
   QRhiGraphicsPipeline* pointPs_ = nullptr;  // Points, no depth (handles on top)
@@ -214,19 +276,15 @@ class TractViewport : public QRhiWidget {
   std::size_t boxVboCap_ = 0;
   std::size_t handleVboCap_ = 0;
   std::size_t highlightVboCap_ = 0;
-  std::size_t sliceVboCap_ = 0;
 
   std::size_t lineVertexCount_ = 0;
   std::size_t cageVertexCount_ = 0;
   std::size_t boxVertexCount_ = 0;
   std::size_t handleVertexCount_ = 0;
   std::size_t highlightVertexCount_ = 0;
-  std::size_t sliceVertexCount_ = 0;
 
-  bool volTexUploaded_ = false;   // the 3D texture matches volTex_ dims + content
-
-  // Per-pane dynamic-offset strides (aligned to ubufAlignment). Each UBO holds
-  // one block per pane; render() binds pane i at offset i * stride.
+  // Per-pane dynamic-offset strides (aligned to ubufAlignment). The line/point
+  // UBOs hold one block per pane; the slice UBO holds one per image×pane.
   quint32 lineUboStride_ = 0;
   quint32 pointUboStride_ = 0;
   quint32 sliceUboStride_ = 0;

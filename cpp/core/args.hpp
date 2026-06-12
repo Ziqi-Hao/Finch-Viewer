@@ -7,6 +7,7 @@ namespace tracto {
 
 struct Args {
   std::string volumePath;
+  std::string labelPath;   // integer-label / segmentation NIfTI (label-coloured)
   std::string trkPath;
   std::string outPath;
   int displayN = 12000;

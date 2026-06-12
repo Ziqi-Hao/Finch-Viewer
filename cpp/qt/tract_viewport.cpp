@@ -104,6 +104,19 @@ void TractViewport::SetLineGeometry(std::vector<float> interleaved, std::vector<
   update();           // schedule a repaint; the upload happens in render()
 }
 
+void TractViewport::SetTractOverlays(std::vector<std::vector<float>> overlays) {
+  // Free GPU buffers for slots that disappear, then move the new data in. Each
+  // retained/new slot is re-uploaded in render() via its dirty flag.
+  for (std::size_t i = overlays.size(); i < overlays_.size(); ++i)
+    if (overlays_[i].vbo) { overlays_[i].vbo->destroy(); delete overlays_[i].vbo; overlays_[i].vbo = nullptr; }
+  overlays_.resize(overlays.size());
+  for (std::size_t i = 0; i < overlays.size(); ++i) {
+    overlays_[i].data = std::move(overlays[i]);
+    overlays_[i].dirty = true;
+  }
+  update();
+}
+
 void TractViewport::SetSelectionQuery(std::function<std::vector<uint8_t>(const Bounds&)> query) {
   selectionQuery_ = std::move(query);
   UpdateHighlight();
@@ -147,22 +160,113 @@ QString TractViewport::RendererName() const {
   return name.isEmpty() ? backend : QStringLiteral("%1 · %2").arg(name, backend);
 }
 
-void TractViewport::SetVolume(Volume volume) {
-  if (volume.Empty()) return;
-  // The volume extent is the primary framing reference: record it and (re)frame
-  // the camera + ortho panes on it, regardless of whether streamlines exist.
-  volumeBounds_ = WorldBounds(volume);
+TractViewport::ImageSlot* TractViewport::FindImage(int id) {
+  for (ImageSlot& s : images_) if (s.id == id) return &s;
+  return nullptr;
+}
+
+void TractViewport::RecomputeDrawOrder() {
+  // Blend order (bottom -> top), stable within each tier: base volumes first
+  // (anatomy underneath), then labels, then heatmaps (the density map) on top so
+  // it reads over whatever anatomy/labels are loaded.
+  drawOrder_.clear();
+  for (int i = 0; i < static_cast<int>(images_.size()); ++i)
+    if (!images_[i].isLabel && !images_[i].heatmap) drawOrder_.push_back(i);
+  for (int i = 0; i < static_cast<int>(images_.size()); ++i)
+    if (images_[i].isLabel) drawOrder_.push_back(i);
+  for (int i = 0; i < static_cast<int>(images_.size()); ++i)
+    if (images_[i].heatmap) drawOrder_.push_back(i);
+}
+
+void TractViewport::RecomputeVolumeBounds() {
+  // The primary image (first non-label, else first loaded) is the framing/scrub
+  // reference: its extent frames the camera, its voxel size is the arrow-key step.
+  if (images_.empty()) { hasVolumeBounds_ = false; return; }
+  // Prefer a real anatomical volume (non-label, non-heatmap) as the framing/scrub
+  // reference; the density heatmap is an auto-generated overlay, not the anatomy.
+  const ImageSlot* p = &images_.front();
+  for (const ImageSlot& s : images_) if (!s.isLabel && !s.heatmap) { p = &s; break; }
+  volumeBounds_ = WorldBounds(p->vol);
   hasVolumeBounds_ = true;
-  camera_.Frame(volumeBounds_);
-  focusInit_ = false;            // re-centre focus / re-fit ortho on the volume
-  if (lineData_.empty()) {       // no streamlines yet -> the cage shows the volume box
-    bounds_ = volumeBounds_;
-    RebuildCage();
+  for (int a = 0; a < 3; ++a) sliceScrubStep_[a] = p->voxelSpacing[a];
+}
+
+void TractViewport::SetImage(int id, Volume vol, bool isLabel,
+                             std::vector<float> lut, int lutWidth) {
+  if (vol.Empty()) return;
+  ImageSlot* s = FindImage(id);
+  const bool isFirst = images_.empty();
+  if (!s) { images_.emplace_back(); s = &images_.back(); s->id = id; }
+
+  s->isLabel = isLabel;
+  s->lut = std::move(lut);
+  s->lutWidth = std::max(1, lutWidth);
+  s->valueMin = vol.valueMin;
+  s->valueRange = std::max(1.0e-6f, vol.valueMax - vol.valueMin);
+  s->voxToWorld = vol.voxelToWorld;
+  s->worldToVox = InverseAffine(s->voxToWorld);
+  for (int a = 0; a < 3; ++a) {
+    s->dims[a] = vol.dims[a];
+    // world mm per voxel along axis a = length of the affine's a-th column.
+    s->voxelSpacing[a] = std::sqrt(s->voxToWorld.m[a] * s->voxToWorld.m[a] +
+                                   s->voxToWorld.m[4 + a] * s->voxToWorld.m[4 + a] +
+                                   s->voxToWorld.m[8 + a] * s->voxToWorld.m[8 + a]);
   }
-  pendingVolume_ = std::move(volume);  // move: no multi-MB voxel copy
-  volumeDirty_ = true;
-  hasVolume_ = true;
+  s->invDims = {1.0f / s->dims[0], 1.0f / s->dims[1], 1.0f / s->dims[2]};
+  s->vol = std::move(vol);  // retained for RHI resource rebuild/re-upload
+  s->texDirty = true;       // (re)create + upload tex (also re-arms lut + quads)
+
+  RecomputeDrawOrder();
+  RecomputeVolumeBounds();
+  // Frame the camera on the FIRST image only; later loads must not yank the view.
+  if (isFirst) {
+    camera_.Frame(volumeBounds_);
+    focusInit_ = false;          // re-centre focus / re-fit ortho on the volume
+    if (lineData_.empty()) { bounds_ = volumeBounds_; RebuildCage(); }
+  }
   update();
+}
+
+void TractViewport::SetImageParams(int id, float winLo, float winHi, float opacity) {
+  ImageSlot* s = FindImage(id);
+  if (!s) return;
+  s->valueMin = winLo;
+  s->valueRange = std::max(1.0e-6f, winHi - winLo);
+  s->opacity = std::clamp(opacity, 0.0f, 1.0f);
+  update();  // picked up by the per-frame UBO write; no texture re-upload
+}
+
+void TractViewport::SetImageVisible(int id, bool visible) {
+  if (ImageSlot* s = FindImage(id)) { s->visible = visible; update(); }
+}
+
+void TractViewport::SetImageHeatmap(int id, bool on) {
+  if (ImageSlot* s = FindImage(id)) {
+    s->heatmap = on;
+    RecomputeDrawOrder();      // heatmaps blend on top -> re-tier the draw order
+    RecomputeVolumeBounds();   // and stop being the framing/scrub reference
+    update();
+  }
+}
+
+void TractViewport::SetImageOrthoOnly(int id, bool on) {
+  if (ImageSlot* s = FindImage(id)) { s->orthoOnly = on; update(); }
+}
+
+void TractViewport::RemoveImage(int id) {
+  for (auto it = images_.begin(); it != images_.end(); ++it) {
+    if (it->id != id) continue;
+    for (QRhiResource* r : {static_cast<QRhiResource*>(it->srb),
+                            static_cast<QRhiResource*>(it->sliceVbo),
+                            static_cast<QRhiResource*>(it->lutTex),
+                            static_cast<QRhiResource*>(it->tex)})
+      if (r) { r->destroy(); delete r; }
+    images_.erase(it);
+    RecomputeDrawOrder();
+    RecomputeVolumeBounds();
+    update();
+    return;
+  }
 }
 
 void TractViewport::SetVolumeVisible(bool visible) {
@@ -175,12 +279,17 @@ void TractViewport::SetTractsVisible(bool visible) {
   update();
 }
 
-void TractViewport::SetVolumeRange(float lo, float hi) {
-  // Grayscale window: the slice shader maps (sample - min)/range. The per-frame
-  // SliceUbo write picks these up, so a repaint is all that's needed.
-  volValueMin_ = lo;
-  volValueRange_ = std::max(1.0e-6f, hi - lo);
-  update();
+void TractViewport::RebuildSliceSrb(ImageSlot& s) {
+  if (!s.srb || !s.tex || !s.lutTex || !sliceUbo_) return;
+  using SRB = QRhiShaderResourceBinding;
+  // Labels sample the 3D texture nearest (exact label values); grayscale linear.
+  QRhiSampler* volSamp = s.isLabel ? nearestSampler_ : sampler_;
+  s.srb->setBindings(
+      {SRB::uniformBufferWithDynamicOffset(0, SRB::VertexStage | SRB::FragmentStage, sliceUbo_,
+                                           sizeof(SliceUbo)),
+       SRB::sampledTexture(1, SRB::FragmentStage, s.tex, volSamp),
+       SRB::sampledTexture(2, SRB::FragmentStage, s.lutTex, nearestSampler_)});
+  s.srb->create();
 }
 
 void TractViewport::SetEditMode(bool on) {
@@ -215,15 +324,17 @@ void TractViewport::RebuildCage() {
   cageDirty_ = true;
 }
 
-void TractViewport::RebuildSliceQuads() {
-  // Place the three slice quads at the shared focus point (world -> voxel index,
-  // clamped into the volume). Order X(0..5), Y(6..11), Z(12..17); 6 verts each.
-  if (volDims_[0] <= 0) return;
-  const float ex = static_cast<float>(volDims_[0] - 1);
-  const float ey = static_cast<float>(volDims_[1] - 1);
-  const float ez = static_cast<float>(volDims_[2] - 1);
+void TractViewport::RebuildSliceQuads(ImageSlot& s) {
+  // Place this image's three slice quads at the shared focus point (world ->
+  // voxel index in THIS image's space, clamped). Order X(0..5), Y(6..11),
+  // Z(12..17); 6 verts each. Each image has its own affine, so its quads sit at
+  // its own voxel coords even though they all pass through the shared focus.
+  if (s.dims[0] <= 0) return;
+  const float ex = static_cast<float>(s.dims[0] - 1);
+  const float ey = static_cast<float>(s.dims[1] - 1);
+  const float ez = static_cast<float>(s.dims[2] - 1);
   const Vec3 f = focus_;
-  const Mat4& w = worldToVox_;
+  const Mat4& w = s.worldToVox;
   float vx = w.m[0] * f.x + w.m[1] * f.y + w.m[2] * f.z + w.m[3];
   float vy = w.m[4] * f.x + w.m[5] * f.y + w.m[6] * f.z + w.m[7];
   float vz = w.m[8] * f.x + w.m[9] * f.y + w.m[10] * f.z + w.m[11];
@@ -234,10 +345,10 @@ void TractViewport::RebuildSliceQuads() {
     const Vec3 q[6] = {a, b, c, a, c, d};
     for (const Vec3& p : q) out.insert(out.end(), {p.x, p.y, p.z});
   };
-  sliceData_.clear();
-  quad(sliceData_, {vx, 0, 0}, {vx, ey, 0}, {vx, ey, ez}, {vx, 0, ez});  // X @ vx
-  quad(sliceData_, {0, vy, 0}, {ex, vy, 0}, {ex, vy, ez}, {0, vy, ez});  // Y @ vy
-  quad(sliceData_, {0, 0, vz}, {ex, 0, vz}, {ex, ey, vz}, {0, ey, vz});  // Z @ vz
+  s.sliceData.clear();
+  quad(s.sliceData, {vx, 0, 0}, {vx, ey, 0}, {vx, ey, ez}, {vx, 0, ez});  // X @ vx
+  quad(s.sliceData, {0, vy, 0}, {ex, vy, 0}, {ex, vy, ez}, {0, vy, ez});  // Y @ vy
+  quad(s.sliceData, {0, 0, vz}, {ex, 0, vz}, {ex, ey, vz}, {0, ey, vz});  // Z @ vz
 }
 
 void TractViewport::PlaceSelectionBoxInBounds(double frac) {
@@ -349,7 +460,7 @@ int TractViewport::PickHandle(const QPoint& pos) const {
 }
 
 int TractViewport::PickSlicePlane(const QPoint& pos) const {
-  if (!hasVolume_ || !hasVolumeBounds_) return -1;
+  if (!hasVolumeBounds_) return -1;
   int rx, ry, rw, rh;
   if (!ThreeDRectLogical(rx, ry, rw, rh)) return -1;          // 3D pane only
   if (pos.x() < rx || pos.x() >= rx + rw || pos.y() < ry || pos.y() >= ry + rh) return -1;
@@ -509,8 +620,10 @@ void TractViewport::CreateResources() {
     return b;
   };
 
-  // One UBO block per pane (4), bound per-pane via a dynamic offset. The stride
-  // is the block size rounded up to the device's UBO alignment (256 on Metal).
+  // Dynamic-offset UBO blocks. The stride is the block size rounded up to the
+  // device's UBO alignment (256 on Metal). line/point hold one block per pane
+  // (4); the slice UBO holds one per image×pane (kMaxBlendImages*4) so several
+  // image layers blend in one pass, each bound at offset (imageRank*4 + pane).
   auto alignUp = [](quint32 v, quint32 a) { return a ? (v + a - 1) / a * a : v; };
   const quint32 ualign = rhi_->ubufAlignment();
   lineUboStride_ = alignUp(sizeof(LineUbo), ualign);
@@ -518,7 +631,7 @@ void TractViewport::CreateResources() {
   sliceUboStride_ = alignUp(sizeof(SliceUbo), ualign);
   lineUbo_ = newUbo("lineUbo", 4 * lineUboStride_);
   pointUbo_ = newUbo("pointUbo", 4 * pointUboStride_);
-  sliceUbo_ = newUbo("sliceUbo", 4 * sliceUboStride_);
+  sliceUbo_ = newUbo("sliceUbo", kMaxBlendImages * 4 * sliceUboStride_);
   if (!lineUbo_ || !pointUbo_ || !sliceUbo_) return;
 
   // The 3D-texture sampler (used by the slice pipeline; created up front so the
@@ -528,12 +641,21 @@ void TractViewport::CreateResources() {
                               QRhiSampler::ClampToEdge);
   if (!sampler_->create()) { check(nullptr, "sampler"); return; }
 
-  // R32F 3D texture, sized 1^3 as a placeholder until the first SetVolume so the
-  // slice SRB/pipeline are valid even with no volume. Re-created at real dims in
-  // render() when volumeDirty_. (R32F = 2x VRAM vs the old GL R16F, but it is the
-  // Metal-safe single-channel float format under RHI.)
+  // Nearest sampler for label volumes (no interpolation across label values) and
+  // for the LUT lookup.
+  nearestSampler_ = rhi_->newSampler(QRhiSampler::Nearest, QRhiSampler::Nearest, QRhiSampler::None,
+                                     QRhiSampler::ClampToEdge, QRhiSampler::ClampToEdge,
+                                     QRhiSampler::ClampToEdge);
+  if (!nearestSampler_->create()) { check(nullptr, "nearestSampler"); return; }
+
+  // 1x1 placeholder textures so the slice pipeline's template SRB is valid with
+  // no image loaded. The real per-image R32F volume + RGBA32F LUT textures live
+  // in each ImageSlot and are created in render(); these placeholders are bound
+  // only by sliceSrb_ (used solely for pipeline creation, never for a draw).
   volTex_ = rhi_->newTexture(QRhiTexture::R32F, 1, 1, 1, 1, QRhiTexture::ThreeDimensional);
   if (!volTex_->create()) { check(nullptr, "volTex"); return; }
+  lutTex_ = rhi_->newTexture(QRhiTexture::RGBA32F, QSize(1, 1), 1);
+  if (!lutTex_->create()) { check(nullptr, "lutTex"); return; }
 
   using SRB = QRhiShaderResourceBinding;
 
@@ -599,13 +721,16 @@ void TractViewport::CreateResources() {
   pointPs_->setDepthWrite(false);
   if (!pointPs_->create()) { check(nullptr, "pointPs"); delete pointPs_; pointPs_ = nullptr; return; }
 
-  // FA slice pipeline (Triangles; 3D texture; alpha blend; depth test, no write
-  // so closer lines occlude slices but slices still blend over lines behind).
+  // Slice pipeline (Triangles; 3D texture; alpha blend; depth test, no write so
+  // closer lines occlude slices but slices still blend over lines behind). The
+  // pipeline needs ONE layout-compatible SRB at creation; each ImageSlot builds
+  // its own SRB (same layout, its own texture) for the actual per-image draws.
   sliceSrb_ = rhi_->newShaderResourceBindings();
   sliceSrb_->setBindings(
       {SRB::uniformBufferWithDynamicOffset(0, SRB::VertexStage | SRB::FragmentStage, sliceUbo_,
                                            sizeof(SliceUbo)),
-       SRB::sampledTexture(1, SRB::FragmentStage, volTex_, sampler_)});
+       SRB::sampledTexture(1, SRB::FragmentStage, volTex_, sampler_),
+       SRB::sampledTexture(2, SRB::FragmentStage, lutTex_, nearestSampler_)});
   if (!sliceSrb_->create()) { check(nullptr, "sliceSrb"); return; }
   slicePs_ = rhi_->newGraphicsPipeline();
   slicePs_->setFlags(QRhiGraphicsPipeline::UsesScissor);
@@ -635,17 +760,36 @@ void TractViewport::CreateResources() {
   cageDirty_ = !cageData_.empty();
   boxDirty_ = hasBox_;
   highlightDirty_ = !highlightData_.empty();
-  if (hasVolume_) volumeDirty_ = true;
+  for (TractOverlay& o : overlays_) o.dirty = !o.data.empty();
+  for (ImageSlot& s : images_) { s.texDirty = s.lutDirty = s.quadsDirty = true; }
+  focusDirty_ = !images_.empty();
 }
 
 void TractViewport::ReleaseAll() {
+  // Per-image GPU resources first (each slot keeps its CPU Volume + lut for
+  // re-upload). Resetting caps/counts forces the syncVbo high-water to re-grow.
+  for (ImageSlot& s : images_) {
+    for (QRhiResource** r : {reinterpret_cast<QRhiResource**>(&s.srb),
+                             reinterpret_cast<QRhiResource**>(&s.sliceVbo),
+                             reinterpret_cast<QRhiResource**>(&s.lutTex),
+                             reinterpret_cast<QRhiResource**>(&s.tex)})
+      if (*r) { (*r)->destroy(); delete *r; *r = nullptr; }
+    s.sliceVboCap = 0;
+    s.sliceVertexCount = 0;
+  }
+  for (TractOverlay& o : overlays_) {
+    if (o.vbo) { o.vbo->destroy(); delete o.vbo; o.vbo = nullptr; }
+    o.cap = 0;
+    o.vertexCount = 0;
+  }
   for (QRhiResource** r : {
            reinterpret_cast<QRhiResource**>(&slicePs_),
            reinterpret_cast<QRhiResource**>(&sliceSrb_),
            reinterpret_cast<QRhiResource**>(&sampler_),
+           reinterpret_cast<QRhiResource**>(&nearestSampler_),
+           reinterpret_cast<QRhiResource**>(&lutTex_),
            reinterpret_cast<QRhiResource**>(&volTex_),
            reinterpret_cast<QRhiResource**>(&sliceUbo_),
-           reinterpret_cast<QRhiResource**>(&sliceVbo_),
            reinterpret_cast<QRhiResource**>(&pointPs_),
            reinterpret_cast<QRhiResource**>(&pointSrb_),
            reinterpret_cast<QRhiResource**>(&pointUbo_),
@@ -663,15 +807,16 @@ void TractViewport::ReleaseAll() {
   }
   // Bug fix: reset the upload/capacity state so a device-loss re-init re-uploads
   // everything instead of skipping it because the old flags said "done".
-  lineVboCap_ = cageVboCap_ = boxVboCap_ = handleVboCap_ = highlightVboCap_ = sliceVboCap_ = 0;
+  lineVboCap_ = cageVboCap_ = boxVboCap_ = handleVboCap_ = highlightVboCap_ = 0;
   lineVertexCount_ = cageVertexCount_ = boxVertexCount_ = handleVertexCount_ =
-      highlightVertexCount_ = sliceVertexCount_ = 0;
-  volTexUploaded_ = false;
+      highlightVertexCount_ = 0;
   lineDirty_ = !lineData_.empty();
   cageDirty_ = !cageData_.empty();
   boxDirty_ = hasBox_;
   highlightDirty_ = !highlightData_.empty();
-  if (hasVolume_) volumeDirty_ = true;
+  for (TractOverlay& o : overlays_) o.dirty = !o.data.empty();
+  for (ImageSlot& s : images_) { s.texDirty = s.lutDirty = s.quadsDirty = true; }
+  focusDirty_ = !images_.empty();
 }
 
 void TractViewport::releaseResources() { ReleaseAll(); rhi_ = nullptr; }
@@ -723,94 +868,106 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
   syncVbo(handleVbo_, handleVboCap_, handleVertexCount_, handleData_, 6, handleDirty);
   boxDirty_ = false;
   syncVbo(highlightVbo_, highlightVboCap_, highlightVertexCount_, highlightData_, 6, highlightDirty_);
+  for (TractOverlay& o : overlays_) syncVbo(o.vbo, o.cap, o.vertexCount, o.data, 6, o.dirty);
 
-  // Volume: (re)size the 3D texture to the volume dims and upload it slice-by-z,
-  // then build the three mid-index slice quads.
-  if (volumeDirty_) {
-    const Volume& v = pendingVolume_;
-    voxToWorld_ = v.voxelToWorld;
-    invDims_ = {1.0f / v.dims[0], 1.0f / v.dims[1], 1.0f / v.dims[2]};
-    volValueMin_ = v.valueMin;
-    volValueRange_ = std::max(1e-6f, v.valueMax - v.valueMin);
-    const int nx = v.dims[0], ny = v.dims[1], nz = v.dims[2];
-
-    const bool dimsChanged = nx != volDims_[0] || ny != volDims_[1] || nz != volDims_[2];
-    if (dimsChanged || !volTex_) {
-      // Re-create the texture at the real dims, then rebuild the SRB to point at
-      // the new texture (an SRB caches the resource handle it was created with).
-      if (volTex_) { volTex_->destroy(); delete volTex_; volTex_ = nullptr; }
-      volTex_ = rhi_->newTexture(QRhiTexture::R32F, nx, ny, nz, 1, QRhiTexture::ThreeDimensional);
-      if (!volTex_->create()) {
+  // Background image layers: (re)create + upload each slot's 3D texture and LUT,
+  // then (further down) its slice quads. The per-slot dirty flags gate every GPU
+  // op, so a steady frame (or a window/opacity tweak) touches none of this.
+  for (ImageSlot& s : images_) {
+    if (s.texDirty) {
+      const Volume& v = s.vol;
+      const int nx = s.dims[0], ny = s.dims[1], nz = s.dims[2];
+      if (s.tex) { s.tex->destroy(); delete s.tex; s.tex = nullptr; }
+      s.tex = rhi_->newTexture(QRhiTexture::R32F, nx, ny, nz, 1, QRhiTexture::ThreeDimensional);
+      if (!s.tex->create()) {
         std::fprintf(stderr, "TractViewport: 3D texture create failed\n");
+        delete s.tex; s.tex = nullptr;
       } else {
-        using SRB = QRhiShaderResourceBinding;
-        sliceSrb_->setBindings(
-            {SRB::uniformBufferWithDynamicOffset(0, SRB::VertexStage | SRB::FragmentStage,
-                                                 sliceUbo_, sizeof(SliceUbo)),
-             SRB::sampledTexture(1, SRB::FragmentStage, volTex_, sampler_)});
-        sliceSrb_->create();  // update() would also work; recreate is fine pre-frame
+        // 3D upload: one entry per z-slice; setDataStride gives the row pitch (x
+        // fastest). Mirrors tract_viewer_rhi.cpp's per-slice upload pattern.
+        std::vector<QRhiTextureUploadEntry> entries;
+        entries.reserve(nz);
+        for (int z = 0; z < nz; ++z) {
+          QRhiTextureSubresourceUploadDescription sub(
+              v.data.data() + static_cast<std::size_t>(z) * nx * ny,
+              static_cast<quint32>(nx) * ny * sizeof(float));
+          sub.setDataStride(static_cast<quint32>(nx) * sizeof(float));
+          entries.emplace_back(z, 0, sub);
+        }
+        QRhiTextureUploadDescription desc;
+        desc.setEntries(entries.begin(), entries.end());
+        u->uploadTexture(s.tex, desc);
       }
-      volDims_[0] = nx; volDims_[1] = ny; volDims_[2] = nz;
+      s.texDirty = false;
+      s.quadsDirty = true;  // dims/affine may have changed -> rebuild quads
+      s.lutDirty = true;    // (re)create the LUT + rebind the SRB against the new tex
     }
-
-    if (volTex_) {
-      // 3D upload: one entry per z-slice; setDataStride gives the row pitch (x
-      // fastest). Mirrors tract_viewer_rhi.cpp's per-slice upload pattern.
-      std::vector<QRhiTextureUploadEntry> entries;
-      entries.reserve(nz);
-      for (int z = 0; z < nz; ++z) {
+    if (s.lutDirty) {
+      // Label colour table (RGBA per index); a 1x1 placeholder for grayscale
+      // images so binding 2 stays valid (the shader never samples it in gray mode).
+      const int w = std::max(1, s.lutWidth);
+      if (s.lutTex) { s.lutTex->destroy(); delete s.lutTex; s.lutTex = nullptr; }
+      s.lutTex = rhi_->newTexture(QRhiTexture::RGBA32F, QSize(w, 1), 1);
+      if (s.lutTex->create() && !s.lut.empty()) {
         QRhiTextureSubresourceUploadDescription sub(
-            v.data.data() + static_cast<std::size_t>(z) * nx * ny,
-            static_cast<quint32>(nx) * ny * sizeof(float));
-        sub.setDataStride(static_cast<quint32>(nx) * sizeof(float));
-        entries.emplace_back(z, 0, sub);
+            s.lut.data(), static_cast<quint32>(s.lut.size() * sizeof(float)));
+        QRhiTextureUploadEntry entry(0, 0, sub);
+        QRhiTextureUploadDescription desc;
+        desc.setEntries(&entry, &entry + 1);
+        u->uploadTexture(s.lutTex, desc);
       }
-      QRhiTextureUploadDescription desc;
-      desc.setEntries(entries.begin(), entries.end());
-      u->uploadTexture(volTex_, desc);
-      volTexUploaded_ = true;
+      if (!s.srb) s.srb = rhi_->newShaderResourceBindings();
+      RebuildSliceSrb(s);  // binds s.tex + s.lutTex (uVol sampler tracks label mode)
+      s.lutDirty = false;
     }
-
-    // world->voxel inverse + per-axis voxel spacing (world mm per voxel, from the
-    // affine columns) — used to place + scrub the focus-driven slice quads.
-    worldToVox_ = InverseAffine(voxToWorld_);
-    for (int a = 0; a < 3; ++a)
-      voxelSpacing_[a] = std::sqrt(voxToWorld_.m[a] * voxToWorld_.m[a] +
-                                   voxToWorld_.m[4 + a] * voxToWorld_.m[4 + a] +
-                                   voxToWorld_.m[8 + a] * voxToWorld_.m[8 + a]);
-
-    pendingVolume_.data.clear();   // free the CPU copy; the texture owns it now
-    pendingVolume_.data.shrink_to_fit();
-    volumeDirty_ = false;
-    sliceQuadsDirty_ = true;       // quads are built at the focus voxel (below)
   }
 
-  // Lazily centre the shared focus and fit the ortho cameras — on the volume
-  // bounds when a volume is loaded (primary framing reference), else the data.
-  if (!focusInit_ && (lineVertexCount_ > 0 || hasVolume_)) {
-    const Bounds& fb = hasVolumeBounds_ ? volumeBounds_ : bounds_;
-    focus_ = {static_cast<float>(0.5 * (fb.v[0] + fb.v[1])),
-              static_cast<float>(0.5 * (fb.v[2] + fb.v[3])),
-              static_cast<float>(0.5 * (fb.v[4] + fb.v[5]))};
-    for (int a = 0; a < 3; ++a) ortho_[a].Frame(fb, a);
+  // Lazily fit the ortho panes and place the shared focus. The ortho VIEW extent
+  // follows the volume (so you see the whole slice), but the focus (which slice
+  // is shown) centres on the streamline bundle when one is loaded — that's where
+  // the density map lives, so it's visible by default — else on the volume.
+  if (!focusInit_ && (lineVertexCount_ > 0 || !images_.empty())) {
+    const Bounds& frameB = hasVolumeBounds_ ? volumeBounds_ : bounds_;  // ortho view extent
+    const Bounds& focusB = (lineVertexCount_ > 0) ? bounds_ : frameB;   // slice at the bundle
+    focus_ = {static_cast<float>(0.5 * (focusB.v[0] + focusB.v[1])),
+              static_cast<float>(0.5 * (focusB.v[2] + focusB.v[3])),
+              static_cast<float>(0.5 * (focusB.v[4] + focusB.v[5]))};
+    for (int a = 0; a < 3; ++a) ortho_[a].Frame(frameB, a);
     focusInit_ = true;
-    sliceQuadsDirty_ = true;
+    focusDirty_ = true;
   }
 
-  // (Re)build the slice quads at the current focus voxel, then upload.
-  if (hasVolume_ && sliceQuadsDirty_) {
-    RebuildSliceQuads();
+  // (Re)build + upload each slot's slice quads when its geometry changed or the
+  // shared focus moved (a scrub/grab moves focus_ for all layers at once).
+  for (ImageSlot& s : images_) {
+    if (!(s.quadsDirty || focusDirty_)) continue;
+    RebuildSliceQuads(s);
     bool d = true;
-    syncVbo(sliceVbo_, sliceVboCap_, sliceVertexCount_, sliceData_, 3, d);
-    sliceQuadsDirty_ = false;
+    syncVbo(s.sliceVbo, s.sliceVboCap, s.sliceVertexCount, s.sliceData, 3, d);
+    s.quadsDirty = false;
   }
+  focusDirty_ = false;
 
   // Fill each active pane's UBO block. OrbitCamera/OrthoSliceCamera.ViewProj are
   // ROW-MAJOR; left-multiply by clipSpaceCorrMatrix() (RHI depth/Y fix) and
   // memcpy the column-major constData() into the pane's slot at i * stride.
   const QMatrix4x4 clip = rhi_->clipSpaceCorrMatrix();
   const int W = px.width(), H = px.height();
-  const QMatrix4x4 v2w = QMatrix4x4(voxToWorld_.m);  // shared by all panes' slice UBO
+
+  // Visible image layers in blend order (non-labels first), capped for the UBO.
+  // Each gets a "rank" k; its UBO block for pane i lives at (k*4 + i) * stride.
+  std::vector<int> vis;
+  vis.reserve(drawOrder_.size());
+  for (int idx : drawOrder_) {
+    const ImageSlot& s = images_[idx];
+    // s.tex implies its SRB was fully built (RebuildSliceSrb needs tex+lutTex); a
+    // failed texture create leaves s.tex null, so skip it rather than bind a
+    // never-created SRB.
+    if (s.visible && s.tex && s.srb && s.sliceVbo && s.sliceVertexCount > 0)
+      vis.push_back(idx);
+    if (static_cast<int>(vis.size()) >= kMaxBlendImages) break;
+  }
+
   for (int i = 0; i < 4; ++i) {
     if (maximized_ >= 0 && i != maximized_) continue;
     int rx, ry, rw, rh;
@@ -836,13 +993,21 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
     pu.params[0] = 13.0f;  // handle point size (px)
     u->updateDynamicBuffer(pointUbo_, i * pointUboStride_, sizeof(pu), &pu);
 
-    if (hasVolume_ && showVolume_ && sliceVertexCount_ > 0) {
-      SliceUbo su{};
-      std::memcpy(su.mvp, mvp.constData(), sizeof(su.mvp));
-      std::memcpy(su.voxToWorld, v2w.constData(), sizeof(su.voxToWorld));
-      su.invDims[0] = invDims_.x; su.invDims[1] = invDims_.y; su.invDims[2] = invDims_.z;
-      su.valueParams[0] = volValueMin_; su.valueParams[1] = volValueRange_;
-      u->updateDynamicBuffer(sliceUbo_, i * sliceUboStride_, sizeof(su), &su);
+    if (showVolume_) {
+      for (int k = 0; k < static_cast<int>(vis.size()); ++k) {
+        const ImageSlot& s = images_[vis[k]];
+        SliceUbo su{};
+        std::memcpy(su.mvp, mvp.constData(), sizeof(su.mvp));
+        const QMatrix4x4 v2w(s.voxToWorld.m);
+        std::memcpy(su.voxToWorld, v2w.constData(), sizeof(su.voxToWorld));
+        su.invDims[0] = s.invDims.x; su.invDims[1] = s.invDims.y; su.invDims[2] = s.invDims.z;
+        su.invDims[3] = static_cast<float>(s.lutWidth);             // label LUT width
+        su.valueParams[0] = s.valueMin; su.valueParams[1] = s.valueRange;
+        su.valueParams[2] = s.opacity;
+        su.valueParams[3] = s.heatmap ? 2.0f : (s.isLabel ? 1.0f : 0.0f);  // 0 gray,1 label,2 heatmap
+        const quint32 off = (static_cast<quint32>(k) * 4 + static_cast<quint32>(i)) * sliceUboStride_;
+        u->updateDynamicBuffer(sliceUbo_, off, sizeof(su), &su);
+      }
     }
   }
 
@@ -860,7 +1025,6 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
     const int axis = PaneAxis(i);
     const QRhiCommandBuffer::DynamicOffset lineOff(0, static_cast<quint32>(i) * lineUboStride_);
     const QRhiCommandBuffer::DynamicOffset pointOff(0, static_cast<quint32>(i) * pointUboStride_);
-    const QRhiCommandBuffer::DynamicOffset sliceOff(0, static_cast<quint32>(i) * sliceUboStride_);
 
     auto drawLines = [&](QRhiBuffer* buf, std::size_t n) {
       if (!buf || n == 0) return;
@@ -869,32 +1033,47 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
       cb->draw(static_cast<quint32>(n));
     };
 
-    // Streamlines (every pane); yellow data cage only in the 3D pane, edit-mode only.
+    // Streamlines render ONLY in the 3-D pane; the 2-D slice panes show the
+    // track-density map instead (much cheaper than the full geometry ×3 panes,
+    // and clearer for slice navigation). showTracts_ gates the active bundle;
+    // overlay bundles draw whenever present. Cage = 3-D, edit-mode only.
     cb->setGraphicsPipeline(linePs_);
     cb->setViewport(vp);
     cb->setScissor(sc);
     cb->setShaderResources(lineSrb_, 1, &lineOff);
-    if (showTracts_) drawLines(lineVbo_, lineVertexCount_);
-    if (axis < 0 && editMode_) drawLines(cageVbo_, cageVertexCount_);
+    if (axis < 0) {
+      if (showTracts_) drawLines(lineVbo_, lineVertexCount_);
+      for (const TractOverlay& o : overlays_) drawLines(o.vbo, o.vertexCount);
+      if (editMode_) drawLines(cageVbo_, cageVertexCount_);
+    }
 
-    // Background slices: 3D shows all three; an ortho pane shows only its axis's
-    // quad. sliceData_ order is X(0..5), Y(6..11), Z(12..17), 6 verts each.
-    if (hasVolume_ && showVolume_ && sliceVbo_ && sliceVertexCount_ > 0 && slicePs_) {
+    // Background image layers: blend each visible slot back-to-front (alpha
+    // blend, depth no-write). 3D pane draws all three quads; an ortho pane draws
+    // only its axis's quad. sliceData order is X(0..5), Y(6..11), Z(12..17).
+    if (showVolume_ && slicePs_) {
       cb->setGraphicsPipeline(slicePs_);
       cb->setViewport(vp);
       cb->setScissor(sc);
-      cb->setShaderResources(sliceSrb_, 1, &sliceOff);
-      QRhiCommandBuffer::VertexInput vin(sliceVbo_, 0);
-      cb->setVertexInput(0, 1, &vin);
-      if (axis < 0) {
-        cb->draw(static_cast<quint32>(sliceVertexCount_));
-      } else if (sliceVertexCount_ >= static_cast<std::size_t>(axis) * 6 + 6) {
-        cb->draw(6, 1, static_cast<quint32>(axis) * 6, 0);
+      for (int k = 0; k < static_cast<int>(vis.size()); ++k) {
+        const ImageSlot& s = images_[vis[k]];
+        if (s.orthoOnly && axis < 0) continue;  // density map: 2-D slice panes only
+        const quint32 off =
+            (static_cast<quint32>(k) * 4 + static_cast<quint32>(i)) * sliceUboStride_;
+        const QRhiCommandBuffer::DynamicOffset so(0, off);
+        cb->setShaderResources(s.srb, 1, &so);
+        QRhiCommandBuffer::VertexInput vin(s.sliceVbo, 0);
+        cb->setVertexInput(0, 1, &vin);
+        if (axis < 0) {
+          cb->draw(static_cast<quint32>(s.sliceVertexCount));
+        } else if (s.sliceVertexCount >= static_cast<std::size_t>(axis) * 6 + 6) {
+          cb->draw(6, 1, static_cast<quint32>(axis) * 6, 0);
+        }
       }
     }
 
-    // White in-box highlight (every pane, on top, no depth).
-    if (highlightPs_ && highlightVbo_ && highlightVertexCount_ > 0) {
+    // White in-box highlight (3-D pane only, on top, no depth) — matches the
+    // streamlines, which only render in the 3-D pane.
+    if (axis < 0 && highlightPs_ && highlightVbo_ && highlightVertexCount_ > 0) {
       cb->setGraphicsPipeline(highlightPs_);
       cb->setViewport(vp);
       cb->setScissor(sc);
@@ -935,7 +1114,8 @@ void TractViewport::mousePressEvent(QMouseEvent* event) {
       activeHandle_ = editMode_ ? PickHandle(event->pos()) : -1;
       if (activeHandle_ >= 0) {
         // editing a box handle
-      } else if (hasVolume_ && showVolume_ && (sliceDragAxis_ = PickSlicePlane(event->pos())) >= 0) {
+      } else if (hasVolumeBounds_ && showVolume_ &&
+                 (sliceDragAxis_ = PickSlicePlane(event->pos())) >= 0) {
         // grabbed a slice plane — slide it along its normal on move
       } else {
         rotating_ = true;
@@ -960,7 +1140,7 @@ void TractViewport::mouseMoveEvent(QMouseEvent* event) {
     if (sliceDragAxis_ == 0) focus_.x += wd;
     else if (sliceDragAxis_ == 1) focus_.y += wd;
     else focus_.z += wd;
-    sliceQuadsDirty_ = true;
+    focusDirty_ = true;  // every layer's slice quads follow the shared focus
     update();
   } else if (activeHandle_ >= 0) {                // 3D box edit (handles live in the 3D pane)
     DragSelectionHandle(QPointF(d.x(), d.y()));
@@ -1033,16 +1213,16 @@ void TractViewport::keyPressEvent(QKeyEvent* event) {
   // the shared focus along that pane's world axis by whole voxels.
   const int axis = hoverPane_ >= 0 ? PaneAxis(hoverPane_) : -1;
   const int key = event->key();
-  if (axis >= 0 && hasVolume_ &&
+  if (axis >= 0 && hasVolumeBounds_ &&
       (key == Qt::Key_Up || key == Qt::Key_Down || key == Qt::Key_PageUp ||
        key == Qt::Key_PageDown)) {
     const float dir = (key == Qt::Key_Up || key == Qt::Key_PageUp) ? 1.0f : -1.0f;
     const float steps = (key == Qt::Key_PageUp || key == Qt::Key_PageDown) ? 10.0f : 1.0f;
-    const float step = dir * steps * voxelSpacing_[axis];
+    const float step = dir * steps * sliceScrubStep_[axis];
     if (axis == 0) focus_.x += step;
     else if (axis == 1) focus_.y += step;
     else focus_.z += step;
-    sliceQuadsDirty_ = true;
+    focusDirty_ = true;  // every layer's slice quads follow the shared focus
     update();
     return;
   }

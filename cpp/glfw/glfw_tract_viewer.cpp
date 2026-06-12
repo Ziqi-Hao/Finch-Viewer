@@ -382,26 +382,32 @@ void GlfwTractViewer::BuildGpuVertices() {
   bool boundsInitialized = false;
 
   for (int fullIndex : display) {
-    const Streamline& sl = tractogram_.streamlines[static_cast<std::size_t>(fullIndex)];
-    if (sl.pointCount < 2) {
+    // Read RAS points from the SoA cloud (offsets[i]..offsets[i+1]); rasPoints
+    // was removed in favour of the single contiguous SoA representation.
+    const std::size_t base =
+        static_cast<std::size_t>(tractogram_.offsets[static_cast<std::size_t>(fullIndex)]);
+    const int32_t pointCount =
+        static_cast<int32_t>(tractogram_.offsets[static_cast<std::size_t>(fullIndex) + 1]) -
+        static_cast<int32_t>(base);
+    if (pointCount < 2) {
       continue;
     }
 
     std::vector<float> points;
-    points.reserve((static_cast<std::size_t>(sl.pointCount) / args_.dispStep + 2) * 3);
+    points.reserve((static_cast<std::size_t>(pointCount) / args_.dispStep + 2) * 3);
     int32_t lastPushed = -1;
-    for (int32_t p = 0; p < sl.pointCount; p += args_.dispStep) {
-      const std::size_t src = static_cast<std::size_t>(p) * 3;
-      points.push_back(sl.rasPoints[src]);
-      points.push_back(sl.rasPoints[src + 1]);
-      points.push_back(sl.rasPoints[src + 2]);
+    for (int32_t p = 0; p < pointCount; p += args_.dispStep) {
+      const std::size_t src = base + static_cast<std::size_t>(p);
+      points.push_back(tractogram_.x[src]);
+      points.push_back(tractogram_.y[src]);
+      points.push_back(tractogram_.z[src]);
       lastPushed = p;
     }
-    if (lastPushed != sl.pointCount - 1) {
-      const std::size_t src = static_cast<std::size_t>(sl.pointCount - 1) * 3;
-      points.push_back(sl.rasPoints[src]);
-      points.push_back(sl.rasPoints[src + 1]);
-      points.push_back(sl.rasPoints[src + 2]);
+    if (lastPushed != pointCount - 1) {
+      const std::size_t src = base + static_cast<std::size_t>(pointCount - 1);
+      points.push_back(tractogram_.x[src]);
+      points.push_back(tractogram_.y[src]);
+      points.push_back(tractogram_.z[src]);
     }
 
     const std::size_t count = points.size() / 3;

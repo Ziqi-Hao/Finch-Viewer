@@ -40,15 +40,6 @@ void MakeFallbackVoxToRas(TrkHeader& header) {
   header.voxToRas[11] = header.origin[2];
 }
 
-std::array<float, 3> TransformPoint(const std::array<double, 16>& m,
-                                    float x, float y, float z) {
-  return {
-      static_cast<float>(m[0] * x + m[1] * y + m[2] * z + m[3]),
-      static_cast<float>(m[4] * x + m[5] * y + m[6] * z + m[7]),
-      static_cast<float>(m[8] * x + m[9] * y + m[10] * z + m[11]),
-  };
-}
-
 TrkHeader ParseTrkHeader(const std::array<char, kTrkHeaderSize>& raw) {
   TrkHeader header;
   header.raw = raw;
@@ -138,19 +129,8 @@ std::vector<Streamline> LoadTrk(const std::string& path, TrkHeader& header) {
       }
     }
 
-    sl.rasPoints.resize(static_cast<std::size_t>(pointCount) * 3);
-    for (int32_t p = 0; p < pointCount; ++p) {
-      const std::size_t src = static_cast<std::size_t>(p) * pointComponents;
-      const auto ras = TransformPoint(header.voxToRas,
-                                      sl.rawPointData[src],
-                                      sl.rawPointData[src + 1],
-                                      sl.rawPointData[src + 2]);
-      const std::size_t dst = static_cast<std::size_t>(p) * 3;
-      sl.rasPoints[dst] = ras[0];
-      sl.rasPoints[dst + 1] = ras[1];
-      sl.rasPoints[dst + 2] = ras[2];
-    }
-
+    // RAS points are derived on demand in BuildSoA (transform applied straight
+    // into the SoA), so we keep only rawPointData here.
     streamlines.push_back(std::move(sl));
   }
 

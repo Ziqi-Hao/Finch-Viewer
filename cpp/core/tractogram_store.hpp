@@ -30,6 +30,16 @@ struct TractogramStore {
 
 void BuildSoA(TractogramStore& store);
 
+// Free the per-point SoA arrays (x/y/z/sid) of a tractogram that is loaded but
+// not currently active — they're only needed for selection/editing. rawPointData
+// (save) and the small per-streamline metadata are kept, so RehydrateSoA can
+// rebuild the cloud in memory when the tractogram is made active again.
+void SlimStore(TractogramStore& store);
+
+// Rebuild the SoA point cloud (x/y/z/sid/…) of a slimmed store from its retained
+// rawPointData (no file re-read). No-op if the cloud is already present.
+void RehydrateSoA(TractogramStore& store);
+
 // RAS-mm axis-aligned bounds over all points (from the SoA x/y/z arrays).
 // Returns a unit box when the store has no points.
 Bounds RasBounds(const TractogramStore& store);

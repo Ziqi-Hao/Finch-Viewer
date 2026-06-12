@@ -18,17 +18,20 @@
 namespace {
 
 // Lenient parse: fills an Args with whatever was provided; missing values keep
-// their defaults. Returns the --trk path (empty if none) to load after show().
-QString ParseQtArgs(const QStringList& argv, tracto::Args& args) {
-  QString trk;
+// their defaults. Returns the --trk paths (--trk is repeatable: load several
+// tractograms, blended) to load after show().
+QStringList ParseQtArgs(const QStringList& argv, tracto::Args& args) {
+  QStringList trks;
   for (int i = 1; i < argv.size(); ++i) {
     const QString key = argv[i];
     auto next = [&]() -> QString { return (i + 1 < argv.size()) ? argv[++i] : QString(); };
     if (key == "--trk") {
-      trk = next();
-      args.trkPath = trk.toStdString();
+      const QString p = next();
+      if (!p.isEmpty()) { trks << p; args.trkPath = p.toStdString(); }
     } else if (key == "--volume" || key == "--fa") {  // --fa: deprecated alias
       args.volumePath = next().toStdString();
+    } else if (key == "--label") {  // integer-label / segmentation NIfTI
+      args.labelPath = next().toStdString();
     } else if (key == "--display-n") {
       args.displayN = next().toInt();
     } else if (key == "--disp-step") {
@@ -38,17 +41,19 @@ QString ParseQtArgs(const QStringList& argv, tracto::Args& args) {
     } else if (key == "--screenshot") {
       args.screenshotPath = next().toStdString();
     } else if (key == "--help" || key == "-h") {
-      std::cout << "Usage: local_editor_qt [--trk in.trk] [--volume vol.nii.gz]\n"
+      std::cout << "Usage: local_editor_qt [--trk in.trk]... [--volume vol.nii.gz]\n"
+                << "                       [--label seg.nii.gz]\n"
                 << "                       [--display-n N] [--disp-step N] [--seed N]\n"
                 << "                       [--screenshot out.png]\n"
-                << "All arguments optional; open/save files from the File menu too.\n";
+                << "--trk is repeatable (blend several tractograms). All optional;\n"
+                << "open/save files from the File menu too.\n";
       std::exit(0);
     }
   }
   // Clamp to a sane floor without re-spelling the defaults (those live in Args).
   args.displayN = std::max(1, args.displayN);
   args.dispStep = std::max(1, args.dispStep);
-  return trk;
+  return trks;
 }
 
 }  // namespace
@@ -60,16 +65,19 @@ int main(int argc, char** argv) {
   tracto::ApplyTheme(app);  // dark "pro" theme: Fusion base + palette + QSS
 
   tracto::Args args;
-  const QString trk = ParseQtArgs(app.arguments(), args);
+  const QStringList trks = ParseQtArgs(app.arguments(), args);
 
   tracto::MainWindow window(args);
   window.resize(1280, 900);
   window.show();
-  if (!trk.isEmpty()) {
-    window.LoadTractogram(trk);
+  for (const QString& trk : trks) {
+    window.LoadTractogram(trk);  // repeatable --trk: each is its own (blended) layer
   }
   if (!args.volumePath.empty()) {
     window.LoadVolume(QString::fromStdString(args.volumePath));
+  }
+  if (!args.labelPath.empty()) {
+    window.LoadLabel(QString::fromStdString(args.labelPath));
   }
 
   // Headless edit smoke test: delete the box and check the alive counts (CPU

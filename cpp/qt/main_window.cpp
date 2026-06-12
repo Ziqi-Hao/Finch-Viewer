@@ -2,6 +2,7 @@
 
 #include "display_geometry.hpp"
 #include "nifti_io.hpp"
+#include "track_density.hpp"
 #include "properties_panel.hpp"
 #include "layers_panel.hpp"
 #include "selection_backend.hpp"
@@ -142,11 +143,11 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   properties_->SetStep(args_.dispStep);
   connect(properties_, &PropertiesPanel::densityChanged, this, [this](int n) {
     args_.displayN = std::max(1, n);
-    if (hasTracts_) RebuildDisplay();
+    if (hasTracts_) RebuildDisplay();  // active only; overlays stay at load density
   });
   connect(properties_, &PropertiesPanel::stepChanged, this, [this](int s) {
     args_.dispStep = std::max(1, s);
-    if (hasTracts_) RebuildDisplay();
+    if (hasTracts_) RebuildDisplay();  // active only; overlays stay at load density
   });
   connect(properties_, &PropertiesPanel::refreshStatsRequested, this, &MainWindow::RefreshStats);
   connect(properties_, &PropertiesPanel::boxChanged, this, [this](const Bounds& box) {
@@ -154,12 +155,12 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   });
   connect(properties_, &PropertiesPanel::contrastRangeChanged, this, [this](double lo, double hi) {
     for (VolumeLayer& vl : volumes_) {
-      if (vl.id != activeVolumeId_) continue;
+      if (vl.id != selectedVolumeId_) continue;
       vl.winLo = static_cast<float>(lo);  // remember per-volume
       vl.winHi = static_cast<float>(hi);
+      if (viewport_) viewport_->SetImageParams(vl.id, vl.winLo, vl.winHi, vl.opacity);
       break;
     }
-    if (viewport_) viewport_->SetVolumeRange(static_cast<float>(lo), static_cast<float>(hi));
   });
 
   auto* scroll = new QScrollArea;
@@ -176,6 +177,7 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   // Left-dock Layers list (Volume / Tracts / Label; load many, check to show).
   layers_ = new LayersPanel;
   connect(layers_, &LayersPanel::visibilityChanged, this, &MainWindow::OnLayerVisibility);
+  connect(layers_, &LayersPanel::opacityChanged, this, &MainWindow::OnLayerOpacity);
   auto* layersDock = new QDockWidget("Layers", this);
   layersDock->setWidget(layers_);
   layersDock->setFeatures(QDockWidget::NoDockWidgetFeatures);
@@ -217,6 +219,9 @@ void MainWindow::LoadTractogram(const QString& path) {
     BuildSoA(b.store);
     b.alive.assign(b.store.StreamlineCount(), 1);
     b.rasBounds = RasBounds(b.store);
+    // Track-density map computed ONCE here from the full original streamlines; it
+    // is cached and reused (independent of edits and the display-density slider).
+    b.densityMap = BuildTrackDensity(b.store, b.alive, 1.0f);  // ~1 mm isotropic grid
     b.name = QFileInfo(path).fileName();
     b.path = path;
     const Bounds& rb = b.rasBounds;
@@ -226,8 +231,9 @@ void MainWindow::LoadTractogram(const QString& path) {
     std::fflush(stdout);
 
     if (layers_) {
+      // Tractograms blend (FSLeyes-style): a new one is visible + becomes the
+      // active editable bundle, but does NOT hide the already-loaded ones.
       b.id = layers_->AddLayer(LayersPanel::Kind::Tracts, b.name, true);
-      for (const TractBundle& other : tracts_) layers_->SetVisible(other.id, false);  // exclusive
     }
     tracts_.push_back(std::move(b));
     ActivateTracts(static_cast<int>(tracts_.size()) - 1);  // archives the previous active
@@ -248,9 +254,23 @@ void MainWindow::ActivateTracts(int index) {
     cur.history = std::move(history_);
     cur.rasBounds = tractRasBounds_;
     cur.dirty = tractsDirty_;
+    // It's now a non-active overlay: cache its display geometry (while it still
+    // has its full SoA), then slim that SoA to free ~half its memory. Hidden
+    // bundles need no overlay, so just slim them.
+    if (cur.visible) {
+      LineGeometry geo = BuildDisplayLineGeometry(cur.store, cur.alive, args_.displayN,
+                                                  args_.dispStep, args_.seed);
+      cur.overlayVerts = std::move(geo.vertices);
+    } else {
+      cur.overlayVerts.clear();
+    }
+    SlimStore(cur.store);  // free x/y/z/sid; RehydrateSoA rebuilds them on re-activate
   }
-  // Swap the requested bundle into the active working members.
+  // Swap the requested bundle into the active working members, rehydrating its
+  // point cloud first if it was slimmed while inactive.
   TractBundle& nb = tracts_[index];
+  RehydrateSoA(nb.store);  // no-op if its SoA is already present
+  nb.overlayVerts.clear();  // active is drawn via lineVbo_, not as an overlay
   store_ = std::move(nb.store);
   aliveFull_ = std::move(nb.alive);
   history_ = std::move(nb.history);
@@ -261,6 +281,8 @@ void MainWindow::ActivateTracts(int index) {
   activeTracts_ = index;
   selection_->Build(store_);  // rebuild the grid index for the now-active tractogram
   RebuildDisplay();
+  RebuildTractOverlays();  // the previously-active bundle (if visible) is now an overlay
+  RebuildDensityMap();     // density map follows the active bundle
 }
 
 bool MainWindow::AnyTractsDirty() const {
@@ -298,17 +320,20 @@ void MainWindow::LoadVolumeLayer(const QString& path, bool isLabel) {
     const QString name = QFileInfo(path).fileName();
     const float vmin = volume.valueMin, vmax = volume.valueMax;  // window default before move
 
-    // Add a layer row in the right group; checking it makes it the active image,
-    // so a fresh load auto-unchecks the other volume/label rows (single render).
+    // Add a layer row in the right group, visible by default. Layers blend
+    // (FSLeyes-style), so loading one does NOT hide the others; it just becomes
+    // the layer the Contrast panel edits.
     const auto kind = isLabel ? LayersPanel::Kind::Label : LayersPanel::Kind::Volume;
     const int id = layers_->AddLayer(kind, name, true);
-    for (const VolumeLayer& other : volumes_) layers_->SetVisible(other.id, false);
     VolumeLayer layer{std::move(volume), name, id, isLabel, vmin, vmax};
     ComputeHistogram(layer);  // fills histBins + adaptive [dispMin,dispMax]; sets the window
+    if (isLabel) ComputeLabelLut(layer);  // per-label colour table for label-mode rendering
     volumes_.push_back(std::move(layer));  // keep our copy (data + histogram + window)
-    activeVolumeId_ = id;
-    viewport_->SetVolume(volumes_.back().vol);  // copies into the viewport texture
-    viewport_->SetVolumeVisible(true);
+    selectedVolumeId_ = id;
+    const VolumeLayer& added = volumes_.back();
+    viewport_->SetImage(id, added.vol, added.isLabel, added.lut, added.lutWidth);
+    viewport_->SetImageParams(id, added.winLo, added.winHi, added.opacity);
+    viewport_->SetImageVisible(id, true);
     UpdateInfo();
     UpdateHistogram();
 
@@ -345,46 +370,57 @@ void MainWindow::OpenLabel() {
 }
 
 void MainWindow::ToggleVolume() {
-  if (activeVolumeId_ < 0) return;  // no volume to toggle
-  const bool visible = !viewport_->VolumeVisible();
-  viewport_->SetVolumeVisible(visible);
-  if (layers_) layers_->SetVisible(activeVolumeId_, visible);  // keep the layer checkbox in sync
+  if (!viewport_) return;
+  // Toolbar shortcut: a global master switch for all slice layers (the per-layer
+  // checkboxes in the Layers panel control individual images).
+  viewport_->SetVolumeVisible(!viewport_->VolumeVisible());
 }
 
 void MainWindow::OnLayerVisibility(int id, bool on) {
-  // A volume layer: the viewport renders one volume at a time, so checking one
-  // makes it active and unchecks the others; unchecking the active one hides it.
+  // Image layers (volumes + labels) blend independently: toggling one only
+  // changes its own visibility. Checking one also makes it the selected layer
+  // for the Contrast panel; unchecking the selected one clears that selection.
   for (const VolumeLayer& vl : volumes_) {
     if (vl.id != id) continue;
-    if (on) {
-      for (const VolumeLayer& other : volumes_)
-        if (other.id != id) layers_->SetVisible(other.id, false);
-      activeVolumeId_ = id;
-      viewport_->SetVolume(vl.vol);  // copy into the viewport texture
-      viewport_->SetVolumeVisible(true);
-    } else if (activeVolumeId_ == id) {
-      viewport_->SetVolumeVisible(false);
-      activeVolumeId_ = -1;
-    }
+    viewport_->SetImageVisible(id, on);
+    if (on) selectedVolumeId_ = id;
+    else if (selectedVolumeId_ == id) selectedVolumeId_ = -1;
     UpdateInfo();
     UpdateHistogram();
     return;
   }
-  // A tractogram layer: one renders at a time, so checking one activates it (and
-  // unchecks the others); unchecking the active one hides the streamlines.
+  // A tractogram layer: bundles blend, so toggling one only changes its own
+  // visibility. Checking one also makes it the active (editable) bundle; the
+  // others stay on as read-only overlays. Unchecking the active hands editing to
+  // another visible bundle (or, if none, just hides it).
   for (int i = 0; i < static_cast<int>(tracts_.size()); ++i) {
     if (tracts_[i].id != id) continue;
+    tracts_[i].visible = on;
+    bool activated = false;
     if (on) {
-      for (int j = 0; j < static_cast<int>(tracts_.size()); ++j)
-        if (j != i) layers_->SetVisible(tracts_[j].id, false);
-      if (i != activeTracts_) {
-        ActivateTracts(i);
-        viewport_->ResetCamera();
-      }
-      viewport_->SetTractsVisible(true);
+      if (i != activeTracts_) { ActivateTracts(i); activated = true; }  // rebuilds display + overlays
     } else if (i == activeTracts_) {
-      viewport_->SetTractsVisible(false);
+      int next = -1;
+      for (int j = 0; j < static_cast<int>(tracts_.size()); ++j)
+        if (j != i && tracts_[j].visible) { next = j; break; }
+      if (next >= 0) { ActivateTracts(next); activated = true; }
     }
+    // Gate the active editable lines on the active bundle's own checkbox.
+    const bool activeVisible = activeTracts_ >= 0 &&
+                               activeTracts_ < static_cast<int>(tracts_.size()) &&
+                               tracts_[activeTracts_].visible;
+    viewport_->SetTractsVisible(activeVisible);
+    viewport_->SetImageVisible(kDensityLayerId, activeVisible);  // density follows the active bundle
+    if (!activated) RebuildTractOverlays();  // ActivateTracts already rebuilds them
+    return;
+  }
+}
+
+void MainWindow::OnLayerOpacity(int id, double opacity) {
+  for (VolumeLayer& vl : volumes_) {
+    if (vl.id != id) continue;
+    vl.opacity = static_cast<float>(opacity);
+    if (viewport_) viewport_->SetImageParams(id, vl.winLo, vl.winHi, vl.opacity);
     return;
   }
 }
@@ -448,6 +484,38 @@ void MainWindow::RebuildDisplay() {
   UpdateStatus();
 }
 
+void MainWindow::RebuildTractOverlays() {
+  // Collect the cached display geometry of every visible non-active bundle. The
+  // geometry was built once (in ActivateTracts, while the bundle still had its
+  // SoA), so this just gathers buffers — no re-decimation, and the slimmed
+  // bundles need no point cloud. Overlays therefore stay at their load-time
+  // density; only the active bundle responds to the density slider.
+  if (!viewport_) return;
+  std::vector<std::vector<float>> overlays;
+  for (int i = 0; i < static_cast<int>(tracts_.size()); ++i) {
+    if (i == activeTracts_ || !tracts_[i].visible || tracts_[i].overlayVerts.empty()) continue;
+    overlays.push_back(tracts_[i].overlayVerts);  // copy: the bundle keeps its cache
+  }
+  viewport_->SetTractOverlays(std::move(overlays));
+}
+
+void MainWindow::RebuildDensityMap() {
+  // Show the ACTIVE bundle's cached density map in the 2-D slice panes (computed
+  // once at load; this only pushes the cached volume, it does NOT recompute). It
+  // is an ortho-only heatmap layer blended over whatever volume(s) are loaded.
+  if (!viewport_) return;
+  if (activeTracts_ < 0 || activeTracts_ >= static_cast<int>(tracts_.size())) {
+    viewport_->RemoveImage(kDensityLayerId);
+    return;
+  }
+  const Volume& tdi = tracts_[activeTracts_].densityMap;
+  if (tdi.Empty()) { viewport_->RemoveImage(kDensityLayerId); return; }
+  viewport_->SetImage(kDensityLayerId, tdi, /*isLabel=*/false, {}, 0);  // copies the cached map
+  viewport_->SetImageHeatmap(kDensityLayerId, true);    // "hot" density ramp
+  viewport_->SetImageOrthoOnly(kDensityLayerId, true);  // 2-D slice panes only
+  viewport_->SetImageVisible(kDensityLayerId, true);
+}
+
 void MainWindow::ReportError(const QString& title, const QString& message) {
   if (args_.screenshotPath.empty()) {
     QMessageBox::critical(this, title, message);
@@ -498,7 +566,7 @@ void MainWindow::UpdateInfo() {
                   QString::fromStdString(FormatCount(store_.StreamlineCount())));
   }
   for (const VolumeLayer& vl : volumes_) {
-    if (vl.id != activeVolumeId_) continue;
+    if (vl.id != selectedVolumeId_) continue;
     s += QStringLiteral("%1:  %2\n         %3×%4×%5   [%6, %7]")
              .arg(vl.isLabel ? "Label" : "Volume", vl.name)
              .arg(vl.vol.dims[0]).arg(vl.vol.dims[1]).arg(vl.vol.dims[2])
@@ -542,15 +610,57 @@ void MainWindow::ComputeHistogram(VolumeLayer& vl) {
   }
 }
 
+void MainWindow::ComputeLabelLut(VolumeLayer& vl) {
+  // Build a dense RGBA table indexed by integer label value (the shader does
+  // texelFetch(uLut, idx)). Index 0 is background → transparent; each non-zero
+  // label gets a distinct hue from the golden-ratio walk (maximally spread,
+  // stable per index). Width = maxLabel+1, capped so a stray huge value can't
+  // allocate an absurd texture (the shader clamps out-of-range indices).
+  constexpr int kMaxLut = 4096;  // covers FreeSurfer aseg (~2035) and atlases
+  int maxLabel = 0;
+  for (float s : vl.vol.data) {
+    const int idx = static_cast<int>(s + 0.5f);
+    if (idx > maxLabel) maxLabel = idx;
+  }
+  const int width = std::clamp(maxLabel + 1, 2, kMaxLut);
+  vl.lut.assign(static_cast<std::size_t>(width) * 4, 0.0f);  // index 0 stays (0,0,0,0)
+
+  auto hsvToRgb = [](float h, float s, float v, float& r, float& g, float& b) {
+    const float i = std::floor(h * 6.0f);
+    const float f = h * 6.0f - i;
+    const float p = v * (1.0f - s), q = v * (1.0f - f * s), t = v * (1.0f - (1.0f - f) * s);
+    switch (static_cast<int>(i) % 6) {
+      case 0: r = v; g = t; b = p; break;
+      case 1: r = q; g = v; b = p; break;
+      case 2: r = p; g = v; b = t; break;
+      case 3: r = p; g = q; b = v; break;
+      case 4: r = t; g = p; b = v; break;
+      default: r = v; g = p; b = q; break;
+    }
+  };
+  constexpr float kGolden = 0.61803398875f;
+  for (int idx = 1; idx < width; ++idx) {
+    const float hue = std::fmod(static_cast<float>(idx) * kGolden, 1.0f);
+    float r, g, b;
+    hsvToRgb(hue, 0.65f, 0.95f, r, g, b);
+    float* px = &vl.lut[static_cast<std::size_t>(idx) * 4];
+    px[0] = r; px[1] = g; px[2] = b; px[3] = 1.0f;
+  }
+  vl.lutWidth = width;
+}
+
 void MainWindow::UpdateHistogram() {
   if (!properties_) return;
+  // The Contrast panel edits the selected layer's window. The image's grayscale-
+  // vs-label mode + LUT were set once at load (SetImage), so only the window /
+  // opacity need re-pushing here.
   for (const VolumeLayer& vl : volumes_) {
-    if (vl.id != activeVolumeId_) continue;
+    if (vl.id != selectedVolumeId_) continue;
     properties_->SetHistogram(true, vl.histBins, vl.dispMin, vl.dispMax, vl.winLo, vl.winHi);
-    if (viewport_) viewport_->SetVolumeRange(vl.winLo, vl.winHi);
+    if (viewport_) viewport_->SetImageParams(vl.id, vl.winLo, vl.winHi, vl.opacity);
     return;
   }
-  properties_->SetHistogram(false, {}, 0.0, 0.0, 0.0, 0.0);  // no active volume
+  properties_->SetHistogram(false, {}, 0.0, 0.0, 0.0, 0.0);  // no selected layer
 }
 
 void MainWindow::RefreshStats() {

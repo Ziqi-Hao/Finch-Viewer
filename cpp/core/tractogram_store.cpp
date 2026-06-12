@@ -1,6 +1,7 @@
 #include "tractogram_store.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 
@@ -28,20 +29,29 @@ void BuildSoA(TractogramStore& store) {
   store.z.resize(totalPoints);
   store.sid.resize(totalPoints);
 
+  // Transform raw points -> RAS mm straight into the SoA. We read rawPointData
+  // (kept for save) and apply the header's voxel->RAS affine inline, so the load
+  // path never materializes a separate per-streamline rasPoints cloud — that
+  // intermediate used to ~double the transient memory during load. Matches the
+  // (row-major) transform in trk_io's TransformPoint.
+  const std::array<double, 16>& M = store.header.voxToRas;
+  const std::size_t comps = static_cast<std::size_t>(3 + std::max<int>(0, store.header.nScalars));
   std::size_t cursor = 0;
   for (std::size_t i = 0; i < n; ++i) {
     const Streamline& sl = store.streamlines[i];
     const std::size_t count = static_cast<std::size_t>(sl.pointCount);
-    if (sl.rasPoints.size() != count * 3) {
-      throw std::runtime_error("invalid RAS point buffer size");
+    if (sl.rawPointData.size() != count * comps) {
+      throw std::runtime_error("invalid raw point buffer size");
     }
 
     double length = 0.0;
     for (std::size_t p = 0; p < count; ++p) {
-      const std::size_t src = p * 3;
-      const float px = sl.rasPoints[src];
-      const float py = sl.rasPoints[src + 1];
-      const float pz = sl.rasPoints[src + 2];
+      const std::size_t src = p * comps;
+      const double rx = sl.rawPointData[src], ry = sl.rawPointData[src + 1],
+                   rz = sl.rawPointData[src + 2];
+      const float px = static_cast<float>(M[0] * rx + M[1] * ry + M[2] * rz + M[3]);
+      const float py = static_cast<float>(M[4] * rx + M[5] * ry + M[6] * rz + M[7]);
+      const float pz = static_cast<float>(M[8] * rx + M[9] * ry + M[10] * rz + M[11]);
       store.x[cursor] = px;
       store.y[cursor] = py;
       store.z[cursor] = pz;
@@ -58,6 +68,20 @@ void BuildSoA(TractogramStore& store) {
     }
     store.lengthsMm[i] = length;
   }
+}
+
+void SlimStore(TractogramStore& store) {
+  // Free the big per-point arrays; keep rawPointData + small per-streamline
+  // metadata so RehydrateSoA can rebuild the cloud. swap-with-empty frees capacity.
+  std::vector<float>().swap(store.x);
+  std::vector<float>().swap(store.y);
+  std::vector<float>().swap(store.z);
+  std::vector<int32_t>().swap(store.sid);
+}
+
+void RehydrateSoA(TractogramStore& store) {
+  if (!store.x.empty() || store.streamlines.empty()) return;  // already present / nothing to do
+  BuildSoA(store);  // rebuilds the SoA from the retained rawPointData (no file re-read)
 }
 
 Bounds RasBounds(const TractogramStore& store) {

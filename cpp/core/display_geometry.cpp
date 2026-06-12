@@ -57,27 +57,32 @@ LineGeometry BuildDisplayLineGeometry(const TractogramStore& store,
     if (static_cast<std::size_t>(fullIndex) >= alive.size() || !alive[static_cast<std::size_t>(fullIndex)]) {
       continue;  // dead -> skip (vanishes in place; survivors keep their slots)
     }
-    const Streamline& sl = store.streamlines[static_cast<std::size_t>(fullIndex)];
-    if (sl.pointCount < 2) {
+    // Read points from the SoA cloud (offsets[i]..offsets[i+1]); the per-streamline
+    // rasPoints AoS is freed after BuildSoA to halve the loaded point memory.
+    const std::size_t base = static_cast<std::size_t>(store.offsets[static_cast<std::size_t>(fullIndex)]);
+    const int32_t pointCount =
+        static_cast<int32_t>(store.offsets[static_cast<std::size_t>(fullIndex) + 1]) -
+        static_cast<int32_t>(base);
+    if (pointCount < 2) {
       continue;
     }
 
     // Decimate, always keeping the final point so endpoints stay anchored.
     std::vector<float> points;
-    points.reserve((static_cast<std::size_t>(sl.pointCount) / static_cast<std::size_t>(step) + 2) * 3);
+    points.reserve((static_cast<std::size_t>(pointCount) / static_cast<std::size_t>(step) + 2) * 3);
     int32_t lastPushed = -1;
-    for (int32_t p = 0; p < sl.pointCount; p += step) {
-      const std::size_t src = static_cast<std::size_t>(p) * 3;
-      points.push_back(sl.rasPoints[src]);
-      points.push_back(sl.rasPoints[src + 1]);
-      points.push_back(sl.rasPoints[src + 2]);
+    for (int32_t p = 0; p < pointCount; p += step) {
+      const std::size_t src = base + static_cast<std::size_t>(p);
+      points.push_back(store.x[src]);
+      points.push_back(store.y[src]);
+      points.push_back(store.z[src]);
       lastPushed = p;
     }
-    if (lastPushed != sl.pointCount - 1) {
-      const std::size_t src = static_cast<std::size_t>(sl.pointCount - 1) * 3;
-      points.push_back(sl.rasPoints[src]);
-      points.push_back(sl.rasPoints[src + 1]);
-      points.push_back(sl.rasPoints[src + 2]);
+    if (lastPushed != pointCount - 1) {
+      const std::size_t src = base + static_cast<std::size_t>(pointCount - 1);
+      points.push_back(store.x[src]);
+      points.push_back(store.y[src]);
+      points.push_back(store.z[src]);
     }
 
     const std::size_t count = points.size() / 3;

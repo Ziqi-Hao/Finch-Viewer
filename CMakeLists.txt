@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 
 project(tractography_local_editor_cpp LANGUAGES CXX C)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,6 +27,7 @@ add_library(tracto_core STATIC
   cpp/core/selection_backend.cpp
   cpp/core/statistics.cpp
   cpp/core/display_geometry.cpp
+  cpp/core/track_density.cpp
   cpp/core/nifti_io.cpp
   cpp/core/utils.cpp
 )
@@ -39,6 +41,12 @@ target_link_libraries(tracto_core PUBLIC ZLIB::ZLIB)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(tracto_core PUBLIC OpenMP::OpenMP_CXX)
   target_compile_definitions(tracto_core PUBLIC HAVE_OPENMP=1)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(core_selftest cpp/core/core_selftest.cpp)
+  target_link_libraries(core_selftest PRIVATE tracto_core)
+  add_test(NAME core_selftest COMMAND core_selftest)
 endif()
 
 # ── vendored GL loader + GLFW (for the GLFW viewer / probe) ──────────────────

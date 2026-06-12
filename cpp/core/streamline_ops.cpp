@@ -6,25 +6,6 @@
 #include <random>
 
 namespace tracto {
-namespace {
-
-bool PointInBounds(const float* p, const Bounds& b) {
-  return p[0] >= b.v[0] && p[0] <= b.v[1] &&
-         p[1] >= b.v[2] && p[1] <= b.v[3] &&
-         p[2] >= b.v[4] && p[2] <= b.v[5];
-}
-
-}  // namespace
-
-bool StreamlineInBounds(const Streamline& sl, const Bounds& b) {
-  const float* pts = sl.rasPoints.data();
-  for (int32_t i = 0; i < sl.pointCount; ++i) {
-    if (PointInBounds(pts + static_cast<std::size_t>(i) * 3, b)) {
-      return true;
-    }
-  }
-  return false;
-}
 
 std::array<unsigned char, 3> DirectionRgbFromPoints(const float* points,
                                                     std::size_t pointCount,
@@ -62,12 +43,6 @@ std::array<unsigned char, 3> DirectionRgbFromPoints(const float* points,
       static_cast<unsigned char>(std::clamp(std::abs(d[1] / n) * 255.0f, 0.0f, 255.0f)),
       static_cast<unsigned char>(std::clamp(std::abs(d[2] / n) * 255.0f, 0.0f, 255.0f)),
   };
-}
-
-std::array<unsigned char, 3> DirectionRgb(const Streamline& sl, int32_t i) {
-  return DirectionRgbFromPoints(sl.rasPoints.data(),
-                                static_cast<std::size_t>(sl.pointCount),
-                                static_cast<std::size_t>(i));
 }
 
 std::vector<int> MakeDisplayIndices(int fullCount, int displayN, uint64_t seed) {

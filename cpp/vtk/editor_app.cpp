@@ -240,18 +240,26 @@ void EditorApp::RebuildDisplayPolyData(bool render) {
       const auto step = static_cast<std::size_t>(args_.dispStep);
       const auto decimatedCount =
           std::max<std::size_t>(2, (static_cast<std::size_t>(sl.pointCount) + step - 1) / step);
+      // Read RAS points from the SoA cloud (rasPoints was removed in favour of
+      // the single contiguous SoA representation).
+      const std::size_t base =
+          static_cast<std::size_t>(tractogram_.offsets[static_cast<std::size_t>(fullIndex)]);
       std::vector<float> displayPoints;
       displayPoints.reserve(decimatedCount * 3);
       for (int32_t p = 0; p < sl.pointCount; p += args_.dispStep) {
-        const std::size_t src = static_cast<std::size_t>(p) * 3;
-        displayPoints.push_back(sl.rasPoints[src]);
-        displayPoints.push_back(sl.rasPoints[src + 1]);
-        displayPoints.push_back(sl.rasPoints[src + 2]);
+        const std::size_t src = base + static_cast<std::size_t>(p);
+        displayPoints.push_back(tractogram_.x[src]);
+        displayPoints.push_back(tractogram_.y[src]);
+        displayPoints.push_back(tractogram_.z[src]);
       }
       if (displayPoints.size() < 6) {
         displayPoints.clear();
-        displayPoints.insert(displayPoints.end(), sl.rasPoints.begin(), sl.rasPoints.begin() + 3);
-        displayPoints.insert(displayPoints.end(), sl.rasPoints.end() - 3, sl.rasPoints.end());
+        const std::size_t last = base + static_cast<std::size_t>(sl.pointCount - 1);
+        for (std::size_t src : {base, last}) {
+          displayPoints.push_back(tractogram_.x[src]);
+          displayPoints.push_back(tractogram_.y[src]);
+          displayPoints.push_back(tractogram_.z[src]);
+        }
       }
 
       const std::size_t displayCount = displayPoints.size() / 3;

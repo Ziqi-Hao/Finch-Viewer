@@ -21,8 +21,7 @@ struct TrkHeader {
 
 struct Streamline {
   int32_t pointCount = 0;
-  std::vector<float> rawPointData;  // x,y,z plus per-point scalars, as stored.
-  std::vector<float> rasPoints;     // x,y,z in RAS mm.
+  std::vector<float> rawPointData;  // x,y,z plus per-point scalars, as stored (kept for save).
   std::vector<float> properties;
 };
 
