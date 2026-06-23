@@ -62,17 +62,23 @@ void HistogramWidget::paintEvent(QPaintEvent*) {
   const int h = height(), w = width();
   p.fillRect(rect(), QColor(theme::kBg1));
 
-  // Bars (sqrt-scaled so the non-background tail is visible past the zero spike).
+  // Bars with an ADAPTIVE y-axis: heights are normalised by a ROBUST peak — the 99th
+  // percentile of the bin counts — not the absolute max. Intensity histograms have a
+  // huge background/zero spike that, used as the scale, flattens the real distribution to
+  // nothing; clipping that one spike to the top lets the meaningful shape fill the height.
+  // sqrt then lifts the low tail so it stays visible.
   if (!bins_.empty()) {
-    float peak = 0.0f;
-    for (float b : bins_) peak = std::max(peak, b);
-    if (peak > 0.0f) {
+    std::vector<float> sorted(bins_);
+    std::sort(sorted.begin(), sorted.end());
+    float robust = sorted[static_cast<std::size_t>(0.99 * (sorted.size() - 1))];
+    if (robust <= 0.0f) robust = sorted.back();  // degenerate (mostly-empty): fall back to max
+    if (robust > 0.0f) {
       p.setPen(Qt::NoPen);
       p.setBrush(QColor(theme::kTextMuted));
       const int n = static_cast<int>(bins_.size());
       const double plotW = std::max(1, w - 2 * kMargin);
       for (int i = 0; i < n; ++i) {
-        const double frac = std::sqrt(bins_[i] / peak);
+        const double frac = std::sqrt(std::min(1.0, static_cast<double>(bins_[i]) / robust));  // clip spike
         const int bh = static_cast<int>(frac * (h - 4));
         const int x0 = kMargin + static_cast<int>(plotW * i / n);
         const int x1 = kMargin + static_cast<int>(plotW * (i + 1) / n);

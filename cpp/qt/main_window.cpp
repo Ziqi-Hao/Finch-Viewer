@@ -22,18 +22,25 @@
 
 #include <QAction>
 #include <QCloseEvent>
+#include <QCoreApplication>
+#include <QDir>
 #include <QDockWidget>
+#include <QDragEnterEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
 #include <QImage>
+#include <QLabel>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMimeData>
 #include <QScrollArea>
+#include <QSettings>
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QTimer>
 #include <QToolBar>
+#include <QUrl>
 
 #include <cmath>
 #include <cstdio>
@@ -387,7 +394,7 @@ int AxialSliceIndex(const tracto::odf::OdfVolume& vol, float worldZ) {
 
 MainWindow::MainWindow(Args args, QWidget* parent)
     : QMainWindow(parent), args_(std::move(args)) {
-  setWindowTitle("Finch-Viewer — tractography editor (Qt/OpenGL)");
+  setWindowTitle("Finch-Viewer — diffusion-MRI viewer");
 
   selection_ = CreateGridSelectionBackend();  // O(box) localized queries; built per load
 
@@ -404,6 +411,33 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   hud_->move(12, 12);
   // Self-contained FPS/CPU/GPU diagnostics, top-right (parents to the viewport).
   new PerfOverlay(viewport_);
+
+  // Drag any supported file onto the window to open it (auto-detected).
+  setAcceptDrops(true);
+
+  // Empty-state invite: centred over the blank viewport until data is loaded. Hosts
+  // clickable shortcuts to load the bundled sample and to the controls cheatsheet.
+  emptyHint_ = new QLabel(viewport_);
+  emptyHint_->setObjectName("emptyHint");
+  emptyHint_->setTextFormat(Qt::RichText);
+  emptyHint_->setAlignment(Qt::AlignCenter);
+  {
+    const QString sample = SamplePath().isEmpty()
+        ? QString()
+        : "<a href='sample' style='color:#5aa0ff;text-decoration:none;'>Load a sample ODF</a> "
+          "&nbsp;·&nbsp; ";
+    emptyHint_->setText(
+        "<div style='color:#9aa0aa;font-size:14px;'>"
+        "<span style='font-size:22px;color:#d7dae0;'>Finch-Viewer</span><br><br>"
+        "Drag a <b>.trk</b> or <b>NIfTI</b> file here, or press <b>⌘/Ctrl&nbsp;O</b> to Open.<br><br>"
+        + sample +
+        "<a href='help' style='color:#5aa0ff;text-decoration:none;'>Controls (?)</a></div>");
+  }
+  connect(emptyHint_, &QLabel::linkActivated, this, [this](const QString& link) {
+    if (link == "sample") LoadSample();
+    else if (link == "help") ShowControlsHelp();
+  });
+  viewport_->installEventFilter(this);  // re-centre emptyHint_ when the viewport resizes
 
   // One QAction per command, shared by the menu bar, the toolbar, and its
   // shortcut — Qt's single-source-of-truth idiom. Slots are defined below.
@@ -479,6 +513,20 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   viewMenu->addAction(toggleVolumeAct);
   viewMenu->addSeparator();
   viewMenu->addAction(editAct_);
+
+  // Help: the controls cheatsheet (? / F1) + a one-click bundled sample.
+  QAction* helpAct = new QAction("Controls", this);
+  helpAct->setToolTip("Show the controls cheatsheet (?)");
+  helpAct->setShortcuts({QKeySequence(Qt::Key_Question), QKeySequence(Qt::Key_F1)});
+  connect(helpAct, &QAction::triggered, this, &MainWindow::ShowControlsHelp);
+  QMenu* helpMenu = menuBar()->addMenu("&Help");
+  helpMenu->addAction(helpAct);
+  if (!SamplePath().isEmpty()) {
+    QAction* sampleAct = new QAction("Open Sample ODF", this);
+    sampleAct->setToolTip("Load the bundled demo fODF");
+    connect(sampleAct, &QAction::triggered, this, &MainWindow::LoadSample);
+    helpMenu->addAction(sampleAct);
+  }
 
   // Compact, always-visible command strip mirroring the actions.
   QToolBar* toolbar = addToolBar("Main");
@@ -568,7 +616,8 @@ MainWindow::MainWindow(Args args, QWidget* parent)
   });
 
   SetEditMode(false);  // start in View: edit tools disabled, Selection/Edit cards hidden
-  statusBar()->showMessage("No tractogram loaded — File ▸ Open TRK…");
+  statusBar()->showMessage("Open a file, drag one in, or press ? for controls.");
+  UpdateEmptyHint();   // show the centred invite over the empty viewport
 }
 
 // Defined here (not =default in the header) so unique_ptr<odf::OdfVolume> destroys a
@@ -674,8 +723,9 @@ bool MainWindow::AnyTractsDirty() const {
 
 void MainWindow::OpenTrk() {
   const QString path =
-      QFileDialog::getOpenFileName(this, "Open tractogram", QString(), "TrackVis (*.trk)");
+      QFileDialog::getOpenFileName(this, "Open tractogram", StartDir(), "TrackVis (*.trk)");
   if (!path.isEmpty()) {
+    RememberDir(path);
     LoadTractogram(path);
   }
 }
@@ -738,22 +788,34 @@ void MainWindow::LoadVolumeLayer(const QString& path, bool isLabel) {
 }
 
 void MainWindow::OpenVolume() {
-  const QString path = QFileDialog::getOpenFileName(this, "Open volume", QString(),
+  const QString path = QFileDialog::getOpenFileName(this, "Open volume", StartDir(),
                                                     "NIfTI (*.nii *.nii.gz)");
-  if (!path.isEmpty()) LoadVolume(path);
+  if (!path.isEmpty()) { RememberDir(path); LoadVolume(path); }
 }
 
 void MainWindow::OpenLabel() {
-  const QString path = QFileDialog::getOpenFileName(this, "Open label / segmentation", QString(),
+  const QString path = QFileDialog::getOpenFileName(this, "Open label / segmentation", StartDir(),
                                                     "NIfTI (*.nii *.nii.gz)");
-  if (!path.isEmpty()) LoadLabel(path);
+  if (!path.isEmpty()) { RememberDir(path); LoadLabel(path); }
 }
 
 void MainWindow::Open() {
-  const QString path = QFileDialog::getOpenFileName(
-      this, "Open", QString(),
+  // Multi-select: pick several files at once and load each (auto-detected). Starts
+  // in the last-used folder and remembers wherever you end up.
+  const QStringList paths = QFileDialog::getOpenFileNames(
+      this, "Open", StartDir(),
       "All supported (*.trk *.nii *.nii.gz);;TrackVis (*.trk);;NIfTI (*.nii *.nii.gz)");
-  if (!path.isEmpty()) DetectAndLoad(path);
+  if (paths.isEmpty()) return;
+  RememberDir(paths.first());
+  for (const QString& path : paths) DetectAndLoad(path);
+}
+
+// ── File-dialog folder memory (persisted across runs via QSettings) ──────────
+QString MainWindow::StartDir() const {
+  return QSettings().value("lastDir").toString();  // empty -> Qt's default (cwd/home)
+}
+void MainWindow::RememberDir(const QString& path) {
+  if (!path.isEmpty()) QSettings().setValue("lastDir", QFileInfo(path).absolutePath());
 }
 
 void MainWindow::DetectAndLoad(const QString& path) {
@@ -847,6 +909,9 @@ void MainWindow::LoadOdf(const QString& path) {
                                  .arg(vol.dims[0]).arg(vol.dims[1]).arg(vol.dims[2])
                                  .arg(lmax).arg(glyphs),
                              8000);
+    odfInfo_ = QStringLiteral("%1\n         %2 glyphs (lmax %3)")
+                   .arg(QFileInfo(path).fileName()).arg(glyphs).arg(lmax);
+    UpdateInfo();
     // Keep the volume resident ONLY when sliced (so scrubbing can rebuild the glyph
     // slice); a whole-shown small ODF needs no rebuild, so free it. (vol read above.)
     odfVol_ = scene.sliced ? std::make_unique<tracto::odf::OdfVolume>(std::move(vol)) : nullptr;
@@ -886,6 +951,9 @@ void MainWindow::LoadDiscreteOdf(const QString& path) {
         QString("ODF loaded (sphere-sampled): %1×%2×%3, %4 directions, %5 glyphs")
             .arg(vol.dims[0]).arg(vol.dims[1]).arg(vol.dims[2]).arg(ndir).arg(glyphs),
         8000);
+    odfInfo_ = QStringLiteral("%1\n         %2 glyphs (%3-dir sphere)")
+                   .arg(QFileInfo(path).fileName()).arg(glyphs).arg(ndir);
+    UpdateInfo();
     // Whole-brain -> always sliced; keep resident for slice-following, flagged discrete.
     odfVol_ = std::make_unique<tracto::odf::OdfVolume>(std::move(vol));
     odfIsDiscrete_ = true;
@@ -923,6 +991,9 @@ bool MainWindow::DisplayPeaks(const odf::OdfVolume& vol, const QString& path) {
   statusBar()->showMessage(QString("Peaks loaded: %1×%2×%3, %4 dirs/voxel, %5 segments")
                                .arg(vol.dims[0]).arg(vol.dims[1]).arg(vol.dims[2]).arg(np).arg(segs),
                            8000);
+  peaksInfo_ = QStringLiteral("%1\n         %2 segments (%3 dirs/voxel)")
+                   .arg(QFileInfo(path).fileName()).arg(segs).arg(np);
+  UpdateInfo();
   return scene.sliced;
 }
 
@@ -1041,10 +1112,11 @@ void MainWindow::SaveAs() {
     return;
   }
   const QString path =
-      QFileDialog::getSaveFileName(this, "Save surviving streamlines", QString(), "TrackVis (*.trk)");
+      QFileDialog::getSaveFileName(this, "Save surviving streamlines", StartDir(), "TrackVis (*.trk)");
   if (path.isEmpty()) {
     return;
   }
+  RememberDir(path);
   // Save is exact: it writes the full-set survivors, not the sampled display.
   if (!WriteTrkSubset(path.toStdString(), store_.header, store_.streamlines, aliveFull_)) {
     QMessageBox::critical(this, "Save failed", "Could not write the output .trk.");
@@ -1076,6 +1148,109 @@ void MainWindow::closeEvent(QCloseEvent* event) {
   } else {
     event->ignore();
   }
+}
+
+// ── Drag & drop: drop any supported file(s) onto the window to open them ─────
+namespace {
+bool IsSupportedDrop(const QString& path) {
+  const QString p = path.toLower();
+  return p.endsWith(".trk") || p.endsWith(".nii") || p.endsWith(".nii.gz");
+}
+}  // namespace
+
+void MainWindow::dragEnterEvent(QDragEnterEvent* event) {
+  if (!event->mimeData()->hasUrls()) return;
+  for (const QUrl& u : event->mimeData()->urls())
+    if (u.isLocalFile() && IsSupportedDrop(u.toLocalFile())) {
+      event->acceptProposedAction();  // show the "drop OK" cursor
+      return;
+    }
+}
+
+void MainWindow::dropEvent(QDropEvent* event) {
+  bool any = false;
+  for (const QUrl& u : event->mimeData()->urls()) {
+    if (!u.isLocalFile() || !IsSupportedDrop(u.toLocalFile())) continue;
+    const QString path = u.toLocalFile();
+    RememberDir(path);
+    DetectAndLoad(path);  // same auto-detect path as File ▸ Open
+    any = true;
+  }
+  if (any) event->acceptProposedAction();
+}
+
+bool MainWindow::eventFilter(QObject* obj, QEvent* event) {
+  if (obj == viewport_ && event->type() == QEvent::Resize) UpdateEmptyHint();  // keep it centred
+  return QMainWindow::eventFilter(obj, event);
+}
+
+// ── Onboarding: empty-state invite + one-click sample + controls cheatsheet ──
+bool MainWindow::SceneHasData() const {
+  return hasTracts_ || !volumes_.empty() ||
+         (viewport_ && (viewport_->HasGlyphs() || viewport_->HasPeaks()));
+}
+
+void MainWindow::UpdateEmptyHint() {
+  if (!emptyHint_ || !viewport_) return;
+  const bool empty = !SceneHasData();
+  if (empty) {
+    emptyHint_->adjustSize();
+    emptyHint_->move((viewport_->width() - emptyHint_->width()) / 2,
+                     (viewport_->height() - emptyHint_->height()) / 2);
+    emptyHint_->raise();
+  }
+  emptyHint_->setVisible(empty);
+}
+
+QString MainWindow::SamplePath() const {
+  // Bundled demo fODF, resolved against likely roots (run-from-repo, or next to the
+  // binary). Empty if absent -> the "Load sample" affordance simply hides.
+  const QString rel = "dmri-explorer/data/odf.nii.gz";
+  const QString appDir = QCoreApplication::applicationDirPath();
+  for (const QString& root : {QDir::currentPath(), appDir, appDir + "/..", appDir + "/../.."}) {
+    const QString p = QDir(root).filePath(rel);
+    if (QFileInfo::exists(p)) return p;
+  }
+  return {};
+}
+
+void MainWindow::LoadSample() {
+  const QString p = SamplePath();
+  if (p.isEmpty())
+    ReportError("Sample not found", "Couldn't find the bundled demo dmri-explorer/data/odf.nii.gz.");
+  else
+    DetectAndLoad(p);
+}
+
+void MainWindow::ShowControlsHelp() {
+  // Compact, non-modal cheatsheet — the app has more controls than the toolbar shows
+  // (slice scrub, per-pane reset, box editing, …).
+  static const QString html = QStringLiteral(
+      "<table cellpadding='4'>"
+      "<tr><td colspan=2><b>Files</b></td></tr>"
+      "<tr><td><b>⌘/Ctrl&nbsp;O</b></td><td>Open &mdash; auto-detects the type</td></tr>"
+      "<tr><td><b>Drag &amp; drop</b></td><td>drop .trk / .nii(.gz) onto the window</td></tr>"
+      "<tr><td><b>⌘/Ctrl&nbsp;S</b></td><td>save surviving streamlines</td></tr>"
+      "<tr><td colspan=2>&nbsp;</td></tr><tr><td colspan=2><b>Navigate</b></td></tr>"
+      "<tr><td><b>Left-drag</b></td><td>orbit (3-D pane) / pan (slice panes)</td></tr>"
+      "<tr><td><b>Right-drag&nbsp;/&nbsp;Wheel</b></td><td>pan / zoom</td></tr>"
+      "<tr><td><b>↑ ↓</b></td><td>scrub slice in the hovered pane (PgUp/PgDn = ×10)</td></tr>"
+      "<tr><td><b>Double-click</b></td><td>maximize / restore a pane</td></tr>"
+      "<tr><td><b>R&nbsp;/&nbsp;⇧R</b></td><td>reset the hovered view / all views</td></tr>"
+      "<tr><td><b>H</b></td><td>toggle volume slices</td></tr>"
+      "<tr><td colspan=2>&nbsp;</td></tr>"
+      "<tr><td colspan=2><b>Edit</b> &nbsp;<span style='color:#888'>(press E for Edit mode)</span></td></tr>"
+      "<tr><td><b>Drag handles</b></td><td>move / resize the 3-D selection box</td></tr>"
+      "<tr><td><b>D&nbsp;/&nbsp;K</b></td><td>delete / keep streamlines in the box</td></tr>"
+      "<tr><td><b>U&nbsp;/&nbsp;B</b></td><td>undo / re-place the box</td></tr></table>");
+  auto* box = new QMessageBox(this);
+  box->setAttribute(Qt::WA_DeleteOnClose);
+  box->setWindowTitle("Controls");
+  box->setTextFormat(Qt::RichText);
+  box->setText(html);
+  box->setStandardButtons(QMessageBox::Close);
+  box->setModal(false);
+  box->show();
 }
 
 void MainWindow::RebuildDisplay() {
@@ -1169,12 +1344,14 @@ void MainWindow::UpdateInfo() {
   }
   for (const VolumeLayer& vl : volumes_) {
     if (vl.id != selectedVolumeId_) continue;
-    s += QStringLiteral("%1:  %2\n         %3×%4×%5   [%6, %7]")
+    s += QStringLiteral("%1:  %2\n         %3×%4×%5   [%6, %7]\n\n")
              .arg(vl.isLabel ? "Label" : "Volume", vl.name)
              .arg(vl.vol.dims[0]).arg(vl.vol.dims[1]).arg(vl.vol.dims[2])
              .arg(vl.vol.valueMin, 0, 'g', 3).arg(vl.vol.valueMax, 0, 'g', 3);
     break;
   }
+  if (!odfInfo_.isEmpty()) s += QStringLiteral("ODF:  %1\n\n").arg(odfInfo_);
+  if (!peaksInfo_.isEmpty()) s += QStringLiteral("Peaks:  %1\n\n").arg(peaksInfo_);
   properties_->SetInfo(s.isEmpty() ? QStringLiteral("No data loaded.") : s.trimmed());
 }
 
@@ -1290,6 +1467,7 @@ void MainWindow::RefreshStats() {
 }
 
 void MainWindow::PollSelectionReadout() {
+  UpdateEmptyHint();  // cheap: reflect load/clear in the centred invite (no per-load wiring)
   if (!properties_) return;
   if (!hasTracts_ || viewport_ == nullptr || !viewport_->HasSelectionBox()) {
     properties_->SetBox(false, Bounds{}, 0, 0.0);

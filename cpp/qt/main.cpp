@@ -76,6 +76,9 @@ int main(int argc, char** argv) {
   // The viewport is a QRhiWidget (Metal on macOS); it configures the graphics
   // API on the widget itself, so no QSurfaceFormat / GL-context request here.
   QApplication app(argc, argv);
+  // Names so QSettings (the file-dialog's remembered folder) lands in a stable place.
+  QCoreApplication::setOrganizationName("Finch");
+  QCoreApplication::setApplicationName("Finch-Viewer");
   tracto::ApplyTheme(app);  // dark "pro" theme: Fusion base + palette + QSS
 
   tracto::Args args;

@@ -19,6 +19,7 @@
 
 class QAction;  // global-namespace Qt types (member pointers only)
 class QTimer;
+class QLabel;
 
 namespace tracto {
 
@@ -61,6 +62,9 @@ class MainWindow : public QMainWindow {
 
  protected:
   void closeEvent(QCloseEvent* event) override;  // prompt if there are unsaved edits
+  void dragEnterEvent(QDragEnterEvent* event) override;    // accept dropped .trk / NIfTI files
+  void dropEvent(QDropEvent* event) override;              // open dropped files (auto-detect)
+  bool eventFilter(QObject* obj, QEvent* event) override;  // re-centre the empty-state invite on resize
 
  private slots:
   void Open();        // unified entry point: pick any file, auto-detect, route
@@ -99,6 +103,14 @@ class MainWindow : public QMainWindow {
   void ActivateTracts(int index);           // archive the active TRK, swap in tracts_[index]
   bool AnyTractsDirty() const;              // any loaded tractogram with unsaved edits
   void LoadVolumeLayer(const QString& path, bool isLabel);  // shared volume/label loader
+  // ── Convenience / onboarding ──────────────────────────────────────────────
+  void ShowControlsHelp();      // controls cheatsheet (? / F1 / Help menu)
+  void LoadSample();            // one-click: open the bundled demo ODF
+  void UpdateEmptyHint();       // show/hide the "drag a file here" invite by data presence
+  bool SceneHasData() const;    // any tractogram / volume / glyphs / peaks loaded
+  QString StartDir() const;     // last-used folder for file dialogs (persisted via QSettings)
+  void RememberDir(const QString& path);
+  QString SamplePath() const;   // bundled demo ODF path if found, else empty
   bool DisplayPeaks(const odf::OdfVolume& vol, const QString& path);  // build+show; true if sliced
   void RebuildSliceGlyphs();  // rebuild resident ODF/peaks at the current scrub slice
   void UpdateInfo();                        // refresh the Properties basic-info readout
@@ -154,6 +166,7 @@ class MainWindow : public QMainWindow {
   static constexpr int kDensityLayerId = -1000;
   TractViewport* viewport_ = nullptr;
   ViewportHud* hud_ = nullptr;            // translucent counts overlay over the viewport
+  QLabel* emptyHint_ = nullptr;           // centered "drag a file here" invite when no data is loaded
   PropertiesPanel* properties_ = nullptr; // right-dock inspector
   LayersPanel* layers_ = nullptr;         // left-dock Layers list (Volume/Tracts/Label)
   bool editMode_ = false;                 // false = View (the default core experience)
@@ -170,6 +183,8 @@ class MainWindow : public QMainWindow {
   // viewport's glyph/peaks layers.
   int odfLayerId_ = -1;
   int peaksLayerId_ = -1;
+  QString odfInfo_;    // Info-panel readout for the loaded ODF (name + glyph count)
+  QString peaksInfo_;  // Info-panel readout for the loaded peaks (name + segment count)
   // Slice-following: the loaded ODF / peaks volumes are kept resident ONLY when the
   // scene is a single slice (whole-brain too big to draw all glyphs), so the glyphs
   // can be rebuilt at the scrubbed slice. Reset (freed) when the scene shows whole.
