@@ -3,8 +3,17 @@
 **Diffusion-MRI tractography & fiber orientation, in one GPU scene — just Open the file.**
 
 <p align="center">
-  <img src="docs/images/odf-glyphs.png" alt="Direction-colored, lit fODF glyphs rendered on the GPU" width="640">
+  <img src="docs/images/odf-glyphs.png" alt="Direction-colored, lit fODF glyphs rendered on the GPU" width="480">
 </p>
+
+<p align="center">
+  <a href="docs/images/ui.png"><img src="docs/images/ui.png" alt="The full app" height="150"></a>
+  &emsp;
+  <a href="docs/images/multimodal.png"><img src="docs/images/multimodal.png" alt="Anatomy, tracts, ODFs and peaks in one scene" height="150"></a>
+  &emsp;
+  <a href="docs/images/peaks.png"><img src="docs/images/peaks.png" alt="DEC peak segments" height="150"></a>
+</p>
+<p align="center"><sub><b>The app</b> &nbsp;·&nbsp; <b>One scene</b> (3-D + tri-planar) &nbsp;·&nbsp; <b>Peaks</b> &nbsp;— click to enlarge</sub></p>
 
 ---
 
@@ -19,23 +28,15 @@
 
 ## Just Open
 
-One unified **Open** auto-detects the file from its header: `.trk` vs NIfTI, and for 4-D NIfTI it tells a scalar volume from an SH-ODF from a peaks field *by content*. No loaders, no modes — just open the file.
+One unified **Open** auto-detects the file from its header: `.trk` vs NIfTI, and for 4-D NIfTI it tells a scalar volume from an SH-ODF from a peaks field *by content*. No loaders, no modes — just open the file (or drag it in).
 
 ## Everything in one scene
 
 3-D plus tri-planar (axial / coronal / sagittal): anatomy, streamlines, glyphs, and peaks rendered together. Glyphs follow the slice you scrub.
 
-<p align="center">
-  <img src="docs/images/multimodal.png" alt="4-view: ODF glyphs in the 3-D pane with FA anatomy in three ortho panes" width="760">
-</p>
-
 ## Peaks
 
 Per-voxel fiber directions as DEC line segments — red = L-R, green = A-P, blue = S-I.
-
-<p align="center">
-  <img src="docs/images/peaks.png" alt="Coronal sheet of direction-encoded-color peak segments" width="640">
-</p>
 
 ## Edit, exactly
 
@@ -44,10 +45,6 @@ Orbit the camera, scrub slices, and draw a 3-D selection box to keep or delete s
 ## The app
 
 Dense-dark UI: a Layers panel (Volume / Tracts / Label / ODF / Peaks), live contrast (intensity histogram + numeric window), per-pane reset view, and an optional FPS/GPU overlay.
-
-<p align="center">
-  <img src="docs/images/ui.png" alt="Full app: Layers panel, 4-view scene, and Properties/Contrast panel" width="900">
-</p>
 
 ---
 
