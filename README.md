@@ -1,56 +1,72 @@
 # Finch-Viewer
 
-A GPU-accelerated, interactive editor for **tractography streamlines**. Load a
-tractogram (`.trk`) over an FA background, carve away unwanted streamlines with a
-3-D selection box (the in-box tracts highlight live), and save the surviving set
-**exactly**.
+**Diffusion-MRI tractography & fiber orientation, in one GPU scene — just Open the file.**
 
-The repo holds two implementations, kept intentionally separate:
-
-- **Python — [`python/`](python/) — the reference editor and behavior source of
-  truth.** This part is complete and fully documented; start at
-  **[python/README.md](python/README.md)**.
-- **C++ — `cpp/` + `CMakeLists.txt` + `tools/` — a port that is still catching
-  up** to the Python reference (work in progress). Build/run notes:
-  [DEV_WORKFLOW.md](DEV_WORKFLOW.md).
-
-Shared `.trk` / `.nii.gz` data lives in `data/` (not tracked — too large for
-GitHub) and is passed to either editor via the CLI.
+<p align="center">
+  <img src="docs/images/odf-glyphs.png" alt="Direction-colored, lit fODF glyphs rendered on the GPU" width="640">
+</p>
 
 ---
 
-## Python quick start
+## Highlights
 
-```bash
-conda create -n trkedit -y python=3.10 && conda activate trkedit
-pip install -r python/requirements.txt
+| | |
+|---|---|
+| **GPU fODF glyphs** | Spherical-harmonic ODFs — direction-colored, lit, GPU-rendered. |
+| **Just Open** | Drop in any `.trk` or NIfTI; it reads the header and figures out the rest. |
+| **One scene** | Streamlines + scalar volumes + ODFs + peaks, in 3-D and tri-planar. |
+| **Exact editing** | Box-select to keep or delete streamlines on large tractograms — saves are exact. |
 
-python python/local_editor.py --fa FA.nii.gz --trk tracts.trk --out edited.trk
+## Just Open
+
+One unified **Open** auto-detects the file from its header: `.trk` vs NIfTI, and for 4-D NIfTI it tells a scalar volume from an SH-ODF from a peaks field *by content*. No loaders, no modes — just open the file.
+
+## Everything in one scene
+
+3-D plus tri-planar (axial / coronal / sagittal): anatomy, streamlines, glyphs, and peaks rendered together. Glyphs follow the slice you scrub.
+
+<p align="center">
+  <img src="docs/images/multimodal.png" alt="4-view: ODF glyphs in the 3-D pane with FA anatomy in three ortho panes" width="760">
+</p>
+
+## Peaks
+
+Per-voxel fiber directions as DEC line segments — red = L-R, green = A-P, blue = S-I.
+
+<p align="center">
+  <img src="docs/images/peaks.png" alt="Coronal sheet of direction-encoded-color peak segments" width="640">
+</p>
+
+## Edit, exactly
+
+Orbit the camera, scrub slices, and draw a 3-D selection box to keep or delete streamlines. The on-screen view is a fast subsample; edits act on the full set — so **saving is exact**.
+
+## The app
+
+Dense-dark UI: a Layers panel (Volume / Tracts / Label / ODF / Peaks), live contrast (intensity histogram + numeric window), per-pane reset view, and an optional FPS/GPU overlay.
+
+<p align="center">
+  <img src="docs/images/ui.png" alt="Full app: Layers panel, 4-view scene, and Properties/Contrast panel" width="900">
+</p>
+
+---
+
+## Built on
+
+- **C++ with Qt and the Qt RHI renderer**, running on **Metal** on macOS. The active editor uses **no VTK**.
+- **Why RHI/Metal:** Apple froze system OpenGL at 4.1 — no compute shaders — so the renderer was migrated to Qt RHI → Metal, the modern GPU path. That migration is the project's headline move (portable to Vulkan / D3D12; macOS/Metal is what's built and tested).
+- **Clean boundaries:** a UI-free core library (io / data / compute), a standalone ODF library, and the Qt app on top.
+- A **Python reference** implementation (VTK) is the behavior source of truth; the C++ app is the GPU-accelerated primary editor.
+
+**Formats:** `.trk` tractograms and NIfTI (`.nii` / `.nii.gz`).
+
+## Build & run
+
+On macOS (Homebrew Qt):
+
+```sh
+tools/build_mac.sh                                             # configure + build
+tools/run_qt_editor.sh --open dmri-explorer/data/odf.nii.gz    # launch (Open detects the type)
 ```
 
-Needs an **on-screen** VTK build (the PyPI `vtk` wheel, not a headless one). Drag
-the gold box (white = selected) then `d` delete / `k` keep; on-screen buttons
-load tracts / an FA image / save. **Full docs, controls, architecture, and the
-15-step development history: [python/README.md](python/README.md).**
-
----
-
-## Features
-
-- Edit on the **full** streamline set (an `alive` mask); the view is only a
-  sampled subset, so **saving is exact**.
-- 3-D box **delete / keep** with the in-box streamlines **highlighted live**.
-- Affine-correct FA orthogonal-slice backdrop.
-- Adjustable display density, runtime `.trk` / FA loading, statistics, and a live
-  GPU/CPU/FPS overlay.
-- Pluggable box-selection backends (vectorized scan or a uniform-grid index).
-
----
-
-## Project docs
-
-- [python/README.md](python/README.md) — the comprehensive Python guide.
-- [CLAUDE.md](CLAUDE.md) — engineering rules (elegant/readable, measure before
-  optimizing, module boundaries).
-- [DEV_WORKFLOW.md](DEV_WORKFLOW.md), [TOOLBOX_PLAN.md](TOOLBOX_PLAN.md) — C++
-  build workflow and toolbox plan.
+More detail in [DEV_WORKFLOW.md](DEV_WORKFLOW.md); the Python reference lives in [python/](python/).

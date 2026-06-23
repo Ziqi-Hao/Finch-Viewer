@@ -1,7 +1,7 @@
 # C++ local editor
 
 > **macOS / Qt:** the active C++ editor is now `local_editor_qt`, a pure
-> **Qt + OpenGL** app (no VTK). See the *macOS (Homebrew)* section of
+> **Qt + RHI (Metal)** app (no VTK). See the *macOS (Homebrew)* section of
 > [DEV_WORKFLOW.md](DEV_WORKFLOW.md). The VTK editor below is legacy and
 > off by default (`-DBUILD_VTK_EDITOR=ON` to build it).
 
@@ -35,7 +35,7 @@ All C++ lives under `cpp/`, split into a shared library plus one folder per app:
   `trk_io` (TrackVis `.trk` load/save + RASMM), `tractogram_store`,
   `streamline_ops`, `selection_backend`, `statistics`, `display_geometry`,
   `nifti_io` (VTK-free NIfTI reader), `render_math`, `utils`.
-- `cpp/qt/` — the primary Qt + OpenGL editor (`main.cpp`, `main_window`, `tract_viewport`).
+- `cpp/qt/` — the primary Qt + RHI (Metal) editor (`main.cpp`, `main_window`, `tract_viewport`).
 - `cpp/glfw/` — the GLFW + OpenGL viewer (`main.cpp`, `glfw_tract_viewer`).
 - `cpp/vtk/` — the legacy VTK editor described below (`main.cpp`, `editor_app`), opt-in.
 
