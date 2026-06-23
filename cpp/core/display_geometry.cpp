@@ -52,6 +52,7 @@ LineGeometry BuildDisplayLineGeometry(const TractogramStore& store,
       MakeDisplayIndices(static_cast<int>(store.StreamlineCount()), displayN, seed);
   const int step = std::max(1, dispStep);
   bool boundsInitialized = false;
+  geo.spans.reserve(display.size());  // exact upper bound: ≤1 span per displayed line
 
   for (int fullIndex : display) {
     if (static_cast<std::size_t>(fullIndex) >= alive.size() || !alive[static_cast<std::size_t>(fullIndex)]) {
