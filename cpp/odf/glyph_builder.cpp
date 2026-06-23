@@ -13,11 +13,34 @@
 
 #include "glyph_builder.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <thread>
 
 namespace tracto {
 namespace odf {
+
+namespace {
+// Run chunkBody(lo, hi) over disjoint sub-ranges of [0, n) on a few threads — each chunk
+// allocates its own scratch and writes a disjoint output range, so there is no sharing.
+// Serial below `serialBelow`: spinning up threads isn't worth it for the 27-glyph demo.
+// Self-contained (std::thread); no OpenMP dependency (Apple clang ships no libomp).
+template <class Fn>
+void ParallelChunks(std::size_t n, std::size_t serialBelow, Fn&& chunkBody) {
+  const unsigned hw = std::thread::hardware_concurrency();
+  const unsigned nThreads = (n > serialBelow && hw > 1) ? std::min(hw, 8u) : 1u;
+  if (nThreads <= 1) { chunkBody(std::size_t{0}, n); return; }
+  const std::size_t chunk = (n + nThreads - 1) / nThreads;
+  std::vector<std::thread> pool;
+  pool.reserve(nThreads);
+  for (unsigned t = 0; t < nThreads; ++t) {
+    const std::size_t lo = static_cast<std::size_t>(t) * chunk, hi = std::min(n, lo + chunk);
+    if (lo < hi) pool.emplace_back([lo, hi, &chunkBody] { chunkBody(lo, hi); });
+  }
+  for (std::thread& th : pool) th.join();
+}
+}  // namespace
 
 Vec3 DirectionColor(Vec3 dir) {
   // Conventional DTI orientation coloring: R=|x|, G=|y|, B=|z| of the unit
@@ -39,19 +62,18 @@ constexpr float kEdgeEps = 1e-4f;
 // amplitudes) — only the radius SOURCE differs, so the deform/normal/index math lives
 // here once. Steps mirror shfield_comp.glsl:64-95 + shfield_vert.glsl:59-86.
 void EmitGlyphFromRadii(GlyphMesh& mesh, const Icosphere& sphere, const Vec3& voxelWorld,
-                        const std::vector<float>& radius, float radiusScale,
-                        std::size_t vertexBase, std::size_t indexBase) {
+                        const std::vector<float>& radius, const std::vector<Vec3>& dirColor,
+                        float radiusScale, std::size_t vertexBase, std::size_t indexBase) {
   const std::size_t nDir = sphere.vertexCount();
   const std::size_t idxPerGlyph = sphere.indices.size();
 
   // 1) Deform the unit sphere radially and place it at the voxel centre. Keep the
   //    deformed offset (glyph-local) for the normal pass — nicer numerically than
-  //    differencing large world coords. Color = direction-encoded fiber color; since
-  //    radius >= 0, normalize(offset) == the unit sample direction.
+  //    differencing large world coords. The direction-encoded fiber color is the same for
+  //    every glyph (the shared sphere), so it is precomputed once by the caller (dirColor).
   for (std::size_t v = 0; v < nDir; ++v) {
-    const Vec3 dir = sphere.vertices[v];
-    mesh.positions[vertexBase + v] = voxelWorld + dir * (radius[v] * radiusScale);
-    mesh.colors[vertexBase + v] = DirectionColor(dir);
+    mesh.positions[vertexBase + v] = voxelWorld + sphere.vertices[v] * (radius[v] * radiusScale);
+    mesh.colors[vertexBase + v] = dirColor[v];
   }
 
   // 2) Recompute per-vertex normals from the DEFORMED surface: accumulate each
@@ -117,31 +139,42 @@ GlyphMesh BuildGlyphs(const OdfVolume& volume,
   GlyphMesh mesh;
   if (!SizeGlyphMesh(mesh, icosphere, voxelIndices.size())) return mesh;  // nothing to draw
 
-  std::vector<float> radius(nDir, 0.0f);     // scratch, reused per glyph
   const std::size_t coeffStride = volume.voxelCount();  // coeffs are OUTERMOST
+  std::vector<Vec3> dirColor(nDir);          // DEC color per direction — same for every glyph
+  for (std::size_t v = 0; v < nDir; ++v) dirColor[v] = DirectionColor(icosphere.vertices[v]);
 
-  for (std::size_t g = 0; g < voxelIndices.size(); ++g) {
-    const VoxelIndex& vox = voxelIndices[g];
-    const float* coeff = volume.voxelCoeffs(vox);
-    const std::size_t vertexBase = g * nDir;
+  // Each glyph writes a DISJOINT vertex/index range (base = g*nDir), so the per-glyph build
+  // is embarrassingly parallel. radius/coeffLocal are per-CHUNK (per-thread) scratch.
+  ParallelChunks(voxelIndices.size(), 256, [&](std::size_t lo, std::size_t hi) {
+    std::vector<float> radius(nDir, 0.0f), coeffLocal(nCoeffs);
+    for (std::size_t g = lo; g < hi; ++g) {
+      const VoxelIndex& vox = voxelIndices[g];
+      const float* coeff = volume.voxelCoeffs(vox);
 
-    // Radius per direction = SH reconstruction sum_c coeff[c]*B[v][c]; clamp negative
-    // lobes (a lobe where the SH sum dips below zero is just absent), track the max.
-    float maxAmp = 0.0f;
-    for (std::size_t v = 0; v < nDir; ++v) {
-      const float* b = basisMatrix.row(v);
-      float r = 0.0f;
-      for (std::size_t c = 0; c < nCoeffs; ++c) r += coeff[c * coeffStride] * b[c];
-      if (params.clampNegative && r < 0.0f) r = 0.0f;
-      radius[v] = r;
-      if (r > maxAmp) maxAmp = r;
+      // Gather this voxel's coefficients into a contiguous buffer ONCE. The source is
+      // coeff-OUTERMOST (consecutive coeffs are voxelCount ~ 15 MB apart), so the matvec
+      // below — which sweeps all nCoeffs for each of the nDir directions — would otherwise
+      // re-fetch the same scattered, cache-missing loads nDir times per glyph.
+      for (std::size_t c = 0; c < nCoeffs; ++c) coeffLocal[c] = coeff[c * coeffStride];
+
+      // Radius per direction = SH reconstruction sum_c coeff[c]*B[v][c]; clamp negative
+      // lobes (a lobe where the SH sum dips below zero is just absent), track the max.
+      float maxAmp = 0.0f;
+      for (std::size_t v = 0; v < nDir; ++v) {
+        const float* b = basisMatrix.row(v);
+        float r = 0.0f;
+        for (std::size_t c = 0; c < nCoeffs; ++c) r += coeffLocal[c] * b[c];  // both contiguous now
+        if (params.clampNegative && r < 0.0f) r = 0.0f;
+        radius[v] = r;
+        if (r > maxAmp) maxAmp = r;
+      }
+      // Per-glyph normalize (shfield_vert.glsl:84-86): divide by the max so glyphs reach
+      // the same nominal size; maxAmp<=0 (empty glyph) leaves it unnormalized.
+      const float normFactor = (params.normalizePerGlyph && maxAmp > 0.0f) ? 1.0f / maxAmp : 1.0f;
+      EmitGlyphFromRadii(mesh, icosphere, VoxelToWorld(volume.affine, vox), radius, dirColor,
+                         normFactor * params.scale, g * nDir, g * icosphere.indices.size());
     }
-    // Per-glyph normalize (shfield_vert.glsl:84-86): divide by the max so glyphs reach
-    // the same nominal size; maxAmp<=0 (empty glyph) leaves it unnormalized.
-    const float normFactor = (params.normalizePerGlyph && maxAmp > 0.0f) ? 1.0f / maxAmp : 1.0f;
-    EmitGlyphFromRadii(mesh, icosphere, VoxelToWorld(volume.affine, vox), radius,
-                       normFactor * params.scale, vertexBase, g * icosphere.indices.size());
-  }
+  });
 
   for (Vec3& n : mesh.normals) n = Normalize(n);  // smooth shading, normalize once
   return mesh;
@@ -163,23 +196,27 @@ GlyphMesh BuildGlyphsSF(const OdfVolume& volume,
   GlyphMesh mesh;
   if (!SizeGlyphMesh(mesh, sphere, voxelIndices.size())) return mesh;
 
-  std::vector<float> radius(nDir, 0.0f);
   const std::size_t ampStride = volume.voxelCount();  // amplitudes are OUTERMOST too
+  std::vector<Vec3> dirColor(nDir);                   // DEC color per direction — glyph-invariant
+  for (std::size_t v = 0; v < nDir; ++v) dirColor[v] = DirectionColor(sphere.vertices[v]);
 
-  for (std::size_t g = 0; g < voxelIndices.size(); ++g) {
-    const VoxelIndex& vox = voxelIndices[g];
-    const float* amp = volume.voxelCoeffs(vox);  // amplitude v at amp[v * ampStride]
-    float maxAmp = 0.0f;
-    for (std::size_t v = 0; v < nDir; ++v) {
-      float r = amp[v * ampStride];
-      if (params.clampNegative && r < 0.0f) r = 0.0f;  // ODF amplitudes are >= 0 anyway
-      radius[v] = r;
-      if (r > maxAmp) maxAmp = r;
+  ParallelChunks(voxelIndices.size(), 256, [&](std::size_t lo, std::size_t hi) {
+    std::vector<float> radius(nDir, 0.0f);           // per-chunk (per-thread) scratch
+    for (std::size_t g = lo; g < hi; ++g) {
+      const VoxelIndex& vox = voxelIndices[g];
+      const float* amp = volume.voxelCoeffs(vox);  // amplitude v at amp[v * ampStride]
+      float maxAmp = 0.0f;
+      for (std::size_t v = 0; v < nDir; ++v) {
+        float r = amp[v * ampStride];
+        if (params.clampNegative && r < 0.0f) r = 0.0f;  // ODF amplitudes are >= 0 anyway
+        radius[v] = r;
+        if (r > maxAmp) maxAmp = r;
+      }
+      const float normFactor = (params.normalizePerGlyph && maxAmp > 0.0f) ? 1.0f / maxAmp : 1.0f;
+      EmitGlyphFromRadii(mesh, sphere, VoxelToWorld(volume.affine, vox), radius, dirColor,
+                         normFactor * params.scale, g * nDir, g * sphere.indices.size());
     }
-    const float normFactor = (params.normalizePerGlyph && maxAmp > 0.0f) ? 1.0f / maxAmp : 1.0f;
-    EmitGlyphFromRadii(mesh, sphere, VoxelToWorld(volume.affine, vox), radius,
-                       normFactor * params.scale, g * nDir, g * sphere.indices.size());
-  }
+  });
 
   for (Vec3& n : mesh.normals) n = Normalize(n);
   return mesh;

@@ -42,6 +42,7 @@
 #include <QToolBar>
 #include <QUrl>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
@@ -91,6 +92,26 @@ void FillSceneFromMesh(OdfGlyphScene& scene, const tracto::odf::GlyphMesh& mesh,
   scene.bounds.v[2] = lo[1]; scene.bounds.v[3] = hi[1];
   scene.bounds.v[4] = lo[2]; scene.bounds.v[5] = hi[2];
   scene.glyphCount = glyphCount;
+}
+
+// Memoized (icosphere, SH basis matrix) for a given (subdiv, nCoeffs). Both are pure
+// functions of those two, but BuildShBasisMatrix evaluates the SH basis at every sphere
+// vertex (nDir·nCoeffs transcendental terms) — rebuilding it on every slice scrub is pure
+// waste, since (subdiv, nCoeffs) are stable across scrubs of one volume. A one-entry cache
+// (not a map) suffices: subdiv only flips at the 512-glyph budget boundary, rarely mid-scrub.
+const std::pair<tracto::odf::Icosphere, tracto::odf::ShBasisMatrix>& CachedGlyphBasis(int subdiv,
+                                                                                      int nCoeffs) {
+  using namespace tracto::odf;
+  static int cachedSubdiv = -1, cachedNCoeffs = -1;
+  static std::pair<Icosphere, ShBasisMatrix> cache;
+  if (subdiv != cachedSubdiv || nCoeffs != cachedNCoeffs) {
+    Icosphere ico = MakeIcosphere(subdiv);
+    ShBasisMatrix B = BuildShBasisMatrix(ico.vertices, InferShOrder(static_cast<std::size_t>(nCoeffs)));
+    cache = {std::move(ico), std::move(B)};
+    cachedSubdiv = subdiv;
+    cachedNCoeffs = nCoeffs;
+  }
+  return cache;
 }
 
 // Reconstruct a bounded set of ODF glyphs on the CPU (cpp/odf). Bounded on purpose:
@@ -144,9 +165,7 @@ OdfGlyphScene BuildOdfGlyphScene(const tracto::odf::OdfVolume& vol, int sliceK =
 
   // Smoother spheres only when there are few glyphs (cost scales with verts*coeffs).
   const int subdiv = (chosen.size() <= 512) ? 3 : 2;
-  const Icosphere ico = MakeIcosphere(subdiv);
-  const ShOrder order = InferShOrder(static_cast<std::size_t>(vol.nCoeffs));
-  const ShBasisMatrix B = BuildShBasisMatrix(ico.vertices, order);
+  const auto& [ico, B] = CachedGlyphBasis(subdiv, vol.nCoeffs);  // rebuilt only on (subdiv,nCoeffs) change
 
   // Glyph radius ~ half a voxel so neighbours don't overlap (voxel size = the
   // shortest affine column length, matching the ODF render prototype).
@@ -163,7 +182,7 @@ OdfGlyphScene BuildOdfGlyphScene(const tracto::odf::OdfVolume& vol, int sliceK =
   gp.clampNegative = true;
   const GlyphMesh mesh = BuildGlyphs(vol, ico, B, chosen, gp);
   FillSceneFromMesh(scene, mesh, chosen.size());
-  scene.lMax = order.lMax;
+  scene.lMax = B.order.lMax;
   return scene;
 }
 
@@ -883,14 +902,17 @@ void MainWindow::LoadOdf(const QString& path) {
       }
       return;
     }
+    const auto t0 = std::chrono::steady_clock::now();
     OdfGlyphScene scene = BuildOdfGlyphScene(vol);
+    const double buildMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (scene.glyphCount == 0 || scene.indices.empty()) {
       ReportError("ODF load failed",
                   "No glyphs to draw (the volume looks empty after thresholding):\n" + path);
       return;
     }
-    std::printf("loaded ODF %dx%dx%d nCoeffs=%d · lMax=%d · %zu glyphs\n",
-                vol.dims[0], vol.dims[1], vol.dims[2], vol.nCoeffs, scene.lMax, scene.glyphCount);
+    std::printf("loaded ODF %dx%dx%d nCoeffs=%d · lMax=%d · %zu glyphs · build %.1f ms\n",
+                vol.dims[0], vol.dims[1], vol.dims[2], vol.nCoeffs, scene.lMax, scene.glyphCount, buildMs);
     std::fflush(stdout);
 
     args_.volumePath = path.toStdString();
