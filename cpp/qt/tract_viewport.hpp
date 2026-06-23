@@ -18,6 +18,7 @@
 #include <QRhiWidget>
 #include <QPoint>
 #include <QPointF>
+#include <QRectF>
 
 #include <array>
 #include <cstddef>
@@ -35,6 +36,8 @@ class QRhiShaderResourceBindings;
 class QRhiGraphicsPipeline;
 
 namespace tracto {
+
+class OrientationOverlay;  // anatomical L/R·A/P·S/I labels (own child widget)
 
 class TractViewport : public QRhiWidget {
   Q_OBJECT
@@ -132,6 +135,12 @@ class TractViewport : public QRhiWidget {
 
   // The four panes of the 2x2 layout (cell order: TL, TR, BL, BR).
   enum class ViewKind { ThreeD, Axial, Coronal, Sagittal };
+
+  // One visible 2-D ortho pane: its logical-pixel rect + world axis (0=X,1=Y,2=Z).
+  // Read by OrientationOverlay to place the L/R·A/P·S/I edge labels. Empty when
+  // nothing is loaded or while a non-ortho pane is maximized.
+  struct OrthoPaneInfo { QRectF rect; int axis; };
+  std::vector<OrthoPaneInfo> OrthoPaneLayout() const;
 
  protected:
   // QRhiWidget lifecycle (replaces initializeGL/paintGL/resizeGL; resize implicit).
@@ -297,6 +306,10 @@ class TractViewport : public QRhiWidget {
   bool rotating_ = false;
   bool panning_ = false;
   bool editMode_ = false;  // opt-in; gates cage/box/handles + box interaction
+
+  // Anatomical orientation labels (L/R·A/P·S/I), a transparent child overlay that
+  // repaints from OrthoPaneLayout(); owned by Qt's parent-child (this).
+  OrientationOverlay* orientOverlay_ = nullptr;
 
   // ── RHI resources (owned; recreated on device loss). ──────────────────────
   QRhi* rhi_ = nullptr;

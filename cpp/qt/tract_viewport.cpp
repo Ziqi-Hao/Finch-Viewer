@@ -1,5 +1,7 @@
 #include "tract_viewport.hpp"
 
+#include "orientation_overlay.hpp"
+
 #include <rhi/qrhi.h>
 #include <QFile>
 #include <QKeyEvent>
@@ -84,6 +86,7 @@ TractViewport::TractViewport(QWidget* parent) : QRhiWidget(parent) {
   setFocusPolicy(Qt::StrongFocus); // needed for keyPressEvent (reset camera)
   setMouseTracking(true);          // hover updates hoverPane_ for arrow-key slice scrub
   highlightClock_.start();         // monotonic clock for throttling the live highlight
+  orientOverlay_ = new OrientationOverlay(this);  // L/R·A/P·S/I labels, drawn over the slices
 }
 
 TractViewport::~TractViewport() {
@@ -642,6 +645,22 @@ void TractViewport::PaneFrac(int i, float& x, float& y, float& w, float& h) cons
   y = (i >= 2) ? 0.5f : 0.0f;  // rows: 0,1 top · 2,3 bottom
   w = 0.5f;
   h = 0.5f;
+}
+
+std::vector<TractViewport::OrthoPaneInfo> TractViewport::OrthoPaneLayout() const {
+  std::vector<OrthoPaneInfo> out;
+  // No spatial content -> no labels (keep the empty viewer clean).
+  if (images_.empty() && !hasGlyphs_ && !hasPeaks_ && lineData_.empty()) return out;
+  const double W = width(), H = height();  // logical pixels = the overlay's QPainter space
+  for (int i = 0; i < 4; ++i) {
+    const int axis = PaneAxis(i);
+    if (axis < 0) continue;                            // skip the 3-D pane (free camera)
+    if (maximized_ >= 0 && i != maximized_) continue;  // hidden while another pane is maximized
+    float fx, fy, fw, fh;
+    PaneFrac(i, fx, fy, fw, fh);
+    out.push_back({QRectF(fx * W, fy * H, fw * W, fh * H), axis});
+  }
+  return out;
 }
 
 void TractViewport::PaneRectPx(int i, int W, int H, int& x, int& yTop, int& w, int& h) const {
@@ -1281,6 +1300,10 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
   }
 
   cb->endPass();
+
+  // Repaint the orientation labels from the (possibly new) content / pane layout.
+  // update() coalesces, so this is one cheap text repaint per event-loop turn.
+  if (orientOverlay_) orientOverlay_->update();
 }
 
 // ── Interaction (renderer-agnostic; unchanged from the GL viewport) ───────────
