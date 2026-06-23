@@ -40,6 +40,7 @@ struct NiftiInfo {
   int ndim = 0;          // dim[0]
   int dim[8] = {0};      // dim[0..7] in header order
   int datatype = 0;      // NIfTI datatype code (DT_FLOAT32 = 16, etc.)
+  int intentCode = 0;    // NIFTI_INTENT_* (5=z, 3=t, 2=correl, 4=F…); 0 = none/unknown
 };
 NiftiInfo PeekNifti(const std::string& path);
 

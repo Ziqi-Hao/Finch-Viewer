@@ -89,6 +89,7 @@ class MainWindow : public QMainWindow {
     float dispMin = 0.0f, dispMax = 1.0f;  // adaptive intensity axis (robust max)
     std::vector<float> lut;             // label mode: RGBA per label index
     int lutWidth = 0;                   // label mode: number of label entries
+    bool isStat = false;                // signed fMRI stat overlay (diverging + threshold)
   };
 
   void RebuildDisplay();   // active full-set alive mask -> sampled GPU line buffer
@@ -116,6 +117,7 @@ class MainWindow : public QMainWindow {
   void UpdateInfo();                        // refresh the Properties basic-info readout
   void UpdateHistogram();                   // active volume -> Contrast histogram + window
   void ComputeHistogram(VolumeLayer& vl);   // bins + adaptive (robust) intensity range
+  void ComputeStatHistogram(VolumeLayer& vl, int intentCode);  // |stat| bins + symmetric threshold/cap
   void ComputeLabelLut(VolumeLayer& vl);    // integer label -> per-label RGBA colour table
   void PushHistory();      // snapshot aliveFull_ for undo (bounded depth)
   std::size_t CountInBox(const std::vector<uint8_t>& inBox) const;  // alive & in box

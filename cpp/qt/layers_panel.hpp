@@ -17,7 +17,7 @@ namespace tracto {
 class LayersPanel : public QWidget {
   Q_OBJECT
  public:
-  enum class Kind { Volume = 0, Tracts = 1, Label = 2, Odf = 3, Peaks = 4 };
+  enum class Kind { Volume = 0, Tracts = 1, Label = 2, Odf = 3, Peaks = 4, Stat = 5 };
 
   explicit LayersPanel(QWidget* parent = nullptr);
 
@@ -32,7 +32,7 @@ class LayersPanel : public QWidget {
 
  private:
   struct Row { QWidget* widget; QCheckBox* check; QSlider* slider; };
-  static constexpr int kKinds = 5;                       // Volume/Tracts/Label/ODF/Peaks
+  static constexpr int kKinds = 6;                       // Volume/Tracts/Label/ODF/Peaks/Stat
   QVBoxLayout* groupLayout_[kKinds] = {nullptr};         // per Kind
   QHash<int, Row> rows_;
   int nextId_ = 1;

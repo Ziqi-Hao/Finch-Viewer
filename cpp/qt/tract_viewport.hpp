@@ -87,6 +87,7 @@ class TractViewport : public QRhiWidget {
   void SetImageParams(int id, float winLo, float winHi, float opacity);  // cheap: UBO only
   void SetImageVisible(int id, bool visible);
   void SetImageHeatmap(int id, bool on);    // render via the "hot" density colour ramp
+  void SetImageStatmap(int id, bool on);    // signed stat overlay (diverging hot/cool + threshold)
   void SetImageOrthoOnly(int id, bool on);  // draw only in the 2-D slice panes (not the 3-D pane)
   void RemoveImage(int id);
 
@@ -254,6 +255,7 @@ class TractViewport : public QRhiWidget {
     float valueMin = 0.0f, valueRange = 1.0f, opacity = 1.0f;
     bool isLabel = false;
     bool heatmap = false;    // density "hot" colour ramp (slice shader mode 2)
+    bool statmap = false;    // signed stat overlay: diverging + threshold (slice shader mode 3)
     bool orthoOnly = false;  // draw only in the 2-D slice panes, not the 3-D pane
     int lutWidth = 1;
     // Source data + derived placement (slice quads live in this image's voxel space).

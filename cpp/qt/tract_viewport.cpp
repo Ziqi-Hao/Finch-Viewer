@@ -237,26 +237,30 @@ TractViewport::ImageSlot* TractViewport::FindImage(int id) {
 }
 
 void TractViewport::RecomputeDrawOrder() {
-  // Blend order (bottom -> top), stable within each tier: base volumes first
-  // (anatomy underneath), then labels, then heatmaps (the density map) on top so
-  // it reads over whatever anatomy/labels are loaded.
+  // Blend order (bottom -> top), stable within each tier: base anatomy volumes
+  // first, then labels, then heatmaps (track density), then stat overlays (fMRI)
+  // on top so the signed activation reads over whatever anatomy/labels are loaded.
   drawOrder_.clear();
   for (int i = 0; i < static_cast<int>(images_.size()); ++i)
-    if (!images_[i].isLabel && !images_[i].heatmap) drawOrder_.push_back(i);
+    if (!images_[i].isLabel && !images_[i].heatmap && !images_[i].statmap) drawOrder_.push_back(i);
   for (int i = 0; i < static_cast<int>(images_.size()); ++i)
     if (images_[i].isLabel) drawOrder_.push_back(i);
   for (int i = 0; i < static_cast<int>(images_.size()); ++i)
     if (images_[i].heatmap) drawOrder_.push_back(i);
+  for (int i = 0; i < static_cast<int>(images_.size()); ++i)
+    if (images_[i].statmap) drawOrder_.push_back(i);
 }
 
 void TractViewport::RecomputeVolumeBounds() {
   // The primary image (first non-label, else first loaded) is the framing/scrub
   // reference: its extent frames the camera, its voxel size is the arrow-key step.
   if (images_.empty()) { hasVolumeBounds_ = false; return; }
-  // Prefer a real anatomical volume (non-label, non-heatmap) as the framing/scrub
-  // reference; the density heatmap is an auto-generated overlay, not the anatomy.
+  // Prefer a real anatomical volume (non-label, non-heatmap, non-statmap) as the
+  // framing/scrub reference; the density heatmap and stat activation map are derived
+  // overlays, not the anatomy.
   const ImageSlot* p = &images_.front();
-  for (const ImageSlot& s : images_) if (!s.isLabel && !s.heatmap) { p = &s; break; }
+  for (const ImageSlot& s : images_)
+    if (!s.isLabel && !s.heatmap && !s.statmap) { p = &s; break; }  // anatomy, not an overlay
   volumeBounds_ = WorldBounds(p->vol);
   hasVolumeBounds_ = true;
   for (int a = 0; a < 3; ++a) sliceScrubStep_[a] = p->voxelSpacing[a];
@@ -316,6 +320,15 @@ void TractViewport::SetImageHeatmap(int id, bool on) {
     s->heatmap = on;
     RecomputeDrawOrder();      // heatmaps blend on top -> re-tier the draw order
     RecomputeVolumeBounds();   // and stop being the framing/scrub reference
+    update();
+  }
+}
+
+void TractViewport::SetImageStatmap(int id, bool on) {
+  if (ImageSlot* s = FindImage(id)) {
+    s->statmap = on;
+    RecomputeDrawOrder();      // stat overlays blend on top -> re-tier the draw order
+    RecomputeVolumeBounds();   // and stop being the framing/scrub reference (it's an overlay)
     update();
   }
 }
@@ -1152,9 +1165,12 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
         std::memcpy(su.voxToWorld, v2w.constData(), sizeof(su.voxToWorld));
         su.invDims[0] = s.invDims.x; su.invDims[1] = s.invDims.y; su.invDims[2] = s.invDims.z;
         su.invDims[3] = static_cast<float>(s.lutWidth);             // label LUT width
+        // Stat mode reuses x/y as (threshold, cap - threshold); SetImageParams stores
+        // them in valueMin/valueRange exactly like a grayscale window, so no extra field.
         su.valueParams[0] = s.valueMin; su.valueParams[1] = s.valueRange;
         su.valueParams[2] = s.opacity;
-        su.valueParams[3] = s.heatmap ? 2.0f : (s.isLabel ? 1.0f : 0.0f);  // 0 gray,1 label,2 heatmap
+        su.valueParams[3] = s.statmap ? 3.0f                    // 0 gray, 1 label, 2 heatmap, 3 stat
+                          : (s.heatmap ? 2.0f : (s.isLabel ? 1.0f : 0.0f));
         const quint32 off = (static_cast<quint32>(k) * 4 + static_cast<quint32>(i)) * sliceUboStride_;
         u->updateDynamicBuffer(sliceUbo_, off, sizeof(su), &su);
       }

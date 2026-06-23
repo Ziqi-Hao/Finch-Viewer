@@ -15,6 +15,7 @@ namespace {
 // NIfTI-1 field byte offsets within the 348-byte header.
 constexpr int kHeaderSize = 348;
 constexpr int kOffDim = 40;        // short[8]
+constexpr int kOffIntentCode = 68; // short (NIFTI_INTENT_*)
 constexpr int kOffDatatype = 70;   // short
 constexpr int kOffBitpix = 72;     // short
 constexpr int kOffPixdim = 76;     // float[8]
@@ -268,9 +269,16 @@ Volume LoadNifti(const std::string& path) {
     vol.voxelToWorld.m[10] = pixdim[3];
   }
 
+  // Sanitize non-finite voxels to 0 in the same pass that scans min/max. Stat maps
+  // (z/t/r) routinely store NaN in masked-out voxels (FSL/SPM/AFNI), and Inf can
+  // appear in ratio maps; this is the single chokepoint, so downstream (the R32F
+  // texture + slice shader, the contrast histogram, the signed-vs-anatomy detection)
+  // never has to special-case NaN — which a GPU would otherwise paint as garbage and
+  // a static_cast<int> would turn into UB. 0 reads as background everywhere.
   float lo = std::numeric_limits<float>::max();
   float hi = std::numeric_limits<float>::lowest();
-  for (float v : vol.data) {
+  for (float& v : vol.data) {
+    if (!std::isfinite(v)) v = 0.0f;
     if (v < lo) lo = v;
     if (v > hi) hi = v;
   }
@@ -339,6 +347,7 @@ NiftiInfo PeekNifti(const std::string& path) {
   for (int d = 0; d <= 7; ++d) info.dim[d] = h.I16(kOffDim + 2 * d);
   info.dim[0] = ndim;  // dim[0] holds the dimensionality, not a size
   info.datatype = h.I16(kOffDatatype);
+  info.intentCode = h.I16(kOffIntentCode);  // statistic hint (z/t/correl/…) for the Open router
   info.ok = true;
   return info;
 }

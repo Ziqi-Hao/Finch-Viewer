@@ -53,6 +53,27 @@
 namespace tracto {
 namespace {
 
+// NIfTI intent codes that mark a per-voxel statistic (fMRI activation / FC maps).
+// Used by the Open router as a positive hint that a 3-D scalar is a stat overlay,
+// not anatomy. Many tools leave intent_code = 0 even for stats, so this only adds
+// to the signed-values heuristic; it never vetoes it.
+bool IsStatIntent(int code) {
+  switch (code) {
+    case 2:   // NIFTI_INTENT_CORREL (Pearson r)
+    case 3:   // NIFTI_INTENT_TTEST
+    case 4:   // NIFTI_INTENT_FTEST
+    case 5:   // NIFTI_INTENT_ZSCORE
+    case 6:   // NIFTI_INTENT_CHISQ
+    case 9:   // NIFTI_INTENT_BETA
+    case 22:  // NIFTI_INTENT_PVAL
+    case 23:  // NIFTI_INTENT_LOGPVAL
+    case 24:  // NIFTI_INTENT_LOG10PVAL
+      return true;
+    default:
+      return false;
+  }
+}
+
 // A drawable ODF glyph scene handed to the viewport: interleaved
 // [pos.xyz, normal.xyz, rgb] vertices + a uint32 triangle index list + the world
 // (RAS) bounds, plus a little metadata for the status line.
@@ -769,19 +790,37 @@ void MainWindow::LoadVolumeLayer(const QString& path, bool isLabel) {
     const QString name = QFileInfo(path).fileName();
     const float vmin = volume.valueMin, vmax = volume.valueMax;  // window default before move
 
+    // fMRI stat-overlay auto-detect: a *signed* scalar (meaningful negatives) or a
+    // NIfTI intent_code marking a statistic is a z/t/r activation map, not anatomy
+    // (T1/EPI/FA/MD are non-negative). Render it diverging + thresholded rather than
+    // grayscale. Labels never qualify — they arrive through the explicit label path.
+    const NiftiInfo peek = PeekNifti(path.toStdString());  // header-only: intent_code
+    const float dynRange = std::max(1.0e-6f, vmax - vmin);
+    const bool signedVals = (vmin / dynRange) < -0.01f;    // negative lobe > 1% of the range
+    const bool isStat = !isLabel && (signedVals || IsStatIntent(peek.intentCode));
+
     // Add a layer row in the right group, visible by default. Layers blend
     // (FSLeyes-style), so loading one does NOT hide the others; it just becomes
     // the layer the Contrast panel edits.
-    const auto kind = isLabel ? LayersPanel::Kind::Label : LayersPanel::Kind::Volume;
+    const auto kind = isStat ? LayersPanel::Kind::Stat
+                             : (isLabel ? LayersPanel::Kind::Label : LayersPanel::Kind::Volume);
     const int id = layers_->AddLayer(kind, name, true);
     VolumeLayer layer{std::move(volume), name, id, isLabel, vmin, vmax};
-    ComputeHistogram(layer);  // fills histBins + adaptive [dispMin,dispMax]; sets the window
+    layer.isStat = isStat;
+    if (isStat)
+      ComputeStatHistogram(layer, peek.intentCode);  // |stat| bins + symmetric threshold/cap
+    else
+      ComputeHistogram(layer);  // grayscale window: histBins + adaptive [dispMin,dispMax]
     if (isLabel) ComputeLabelLut(layer);  // per-label colour table for label-mode rendering
     volumes_.push_back(std::move(layer));  // keep our copy (data + histogram + window)
     selectedVolumeId_ = id;
     const VolumeLayer& added = volumes_.back();
     viewport_->SetImage(id, added.vol, added.isLabel, added.lut, added.lutWidth);
     viewport_->SetImageParams(id, added.winLo, added.winHi, added.opacity);
+    if (isStat) {
+      viewport_->SetImageStatmap(id, true);    // diverging hot/cool ramp + |stat| threshold
+      viewport_->SetImageOrthoOnly(id, true);  // 2-D panes only (avoid 3-D co-planar z-fighting)
+    }
     viewport_->SetImageVisible(id, true);
     UpdateInfo();
     UpdateHistogram();
@@ -797,9 +836,9 @@ void MainWindow::LoadVolumeLayer(const QString& path, bool isLabel) {
       statusBar()->showMessage(
           "⚠ Image does not overlap the streamlines — likely a different space.", 12000);
     } else {
+      const char* what = isStat ? "Stat overlay" : (isLabel ? "Label" : "Volume");
       statusBar()->showMessage(
-          QString("%1 loaded: %2×%3×%4").arg(isLabel ? "Label" : "Volume").arg(dx).arg(dy).arg(dz),
-          8000);
+          QString("%1 loaded: %2×%3×%4").arg(what).arg(dx).arg(dy).arg(dz), 8000);
     }
   } catch (const std::exception& e) {
     ReportError(isLabel ? "Label load failed" : "Volume load failed", e.what());
@@ -1407,6 +1446,64 @@ void MainWindow::ComputeHistogram(VolumeLayer& vl) {
   for (int j = 0; j < kFine; ++j) {
     const double cj = dmin + (j + 0.5) / kFine * (static_cast<double>(dmax) - dmin);
     const int db = std::clamp(static_cast<int>((cj - vl.dispMin) / span * kDisp), 0, kDisp - 1);
+    vl.histBins[db] += static_cast<float>(fine[j]);
+  }
+}
+
+void MainWindow::ComputeStatHistogram(VolumeLayer& vl, int intentCode) {
+  // An fMRI stat map (z/t/r/…) is SIGNED and symmetric about 0, so the meaningful
+  // axis is |stat|, not the raw min/max grayscale window (which a single outlier
+  // would wreck). Build a |stat| histogram over the non-zero voxels (the map is
+  // mostly exact-0 background) and seed a [threshold, cap] window that is data-aware
+  // and editable: cap from a robust high percentile so a few hot peaks don't squash
+  // the scale; threshold by statistic kind (z/t≈2.3, r≈0.3 — FSL/SPM conventions),
+  // else a robust percentile so low-magnitude noise starts hidden.
+  const Volume& v = vl.vol;  // data is finite — LoadNifti sanitizes NaN/Inf to 0 at load
+  float absMax = 0.0f;
+  for (float s : v.data) absMax = std::max(absMax, std::abs(s));
+  if (absMax <= 0.0f) absMax = 1.0f;
+
+  constexpr int kFine = 1024;
+  std::vector<double> fine(kFine, 0.0);
+  const double finv = static_cast<double>(kFine - 1) / absMax;
+  double nz = 0.0;  // count of non-zero voxels (background excluded from percentiles)
+  for (float s : v.data) {
+    const float a = std::abs(s);
+    if (a <= 0.0f) continue;
+    fine[std::clamp(static_cast<int>(a * finv), 0, kFine - 1)] += 1.0;
+    nz += 1.0;
+  }
+  if (nz <= 0.0) nz = 1.0;
+  auto percentile = [&](double frac) {
+    double cum = 0.0;
+    for (int i = 0; i < kFine; ++i) {
+      cum += fine[i];
+      if (cum >= frac * nz) return static_cast<float>((i + 1) / static_cast<double>(kFine) * absMax);
+    }
+    return absMax;
+  };
+
+  const float cap = percentile(0.98);                          // default high handle
+  const float axisMax = std::max(cap, percentile(0.999));      // histogram axis (headroom over cap)
+  float thr;
+  switch (intentCode) {
+    case 5: case 3: thr = 2.3f; break;            // ZSCORE / TTEST (FSL cluster-forming default)
+    case 2:         thr = 0.3f; break;            // CORREL (Pearson r)
+    default:        thr = percentile(0.80); break;  // unknown signed map: hide the low-magnitude bulk
+  }
+  thr = std::clamp(thr, 0.0f, 0.9f * cap);        // keep threshold below the cap (winLo < winHi)
+
+  vl.dispMin = 0.0f;
+  vl.dispMax = axisMax;
+  vl.winLo = thr;   // |stat| threshold (low handle)
+  vl.winHi = cap;   // |stat| cap       (high handle)
+
+  // 160 display bins over [0, axisMax], aggregated from the fine |stat| bins.
+  constexpr int kDisp = 160;
+  vl.histBins.assign(kDisp, 0.0f);
+  for (int j = 0; j < kFine; ++j) {
+    const double cj = (j + 0.5) / kFine * absMax;
+    const int db = std::clamp(static_cast<int>(cj / axisMax * kDisp), 0, kDisp - 1);
     vl.histBins[db] += static_cast<float>(fine[j]);
   }
 }
