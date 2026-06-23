@@ -64,6 +64,9 @@ class PropertiesPanel : public QWidget {
   QLabel* infoLabel_ = nullptr;         // top: basic volume/tractogram info
   QGroupBox* contrastCard_ = nullptr;   // hidden when no volume is active
   HistogramWidget* histogram_ = nullptr;
+  QDoubleSpinBox* contrastLo_ = nullptr;   // editable window low (data units)
+  QDoubleSpinBox* contrastHi_ = nullptr;   // editable window high (data units)
+  QLabel* contrastRangeLabel_ = nullptr;   // "data range  min – max"
   QGroupBox* selectionCard_ = nullptr;  // hidden in view mode
   QGroupBox* editCard_ = nullptr;       // hidden in view mode
   QSlider* densitySlider_;

@@ -13,8 +13,8 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
   root->setContentsMargins(10, 10, 10, 10);
   root->setSpacing(10);
 
-  const char* titles[3] = {"Volume", "Tracts", "Label"};
-  for (int k = 0; k < 3; ++k) {
+  const char* titles[kKinds] = {"Volume", "Tracts", "Label", "ODF", "Peaks"};
+  for (int k = 0; k < kKinds; ++k) {
     auto* box = new QGroupBox(titles[k]);
     groupLayout_[k] = new QVBoxLayout(box);
     groupLayout_[k]->setContentsMargins(8, 6, 8, 6);
@@ -40,7 +40,7 @@ int LayersPanel::AddLayer(Kind kind, const QString& name, bool visible) {
   col->addWidget(cb);
 
   QSlider* slider = nullptr;
-  if (kind != Kind::Tracts) {
+  if (kind == Kind::Volume || kind == Kind::Label) {  // only image layers fade; tracts/ODF/peaks are opaque
     slider = new QSlider(Qt::Horizontal);
     slider->setRange(0, 100);
     slider->setValue(100);

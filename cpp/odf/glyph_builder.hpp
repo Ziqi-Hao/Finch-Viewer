@@ -80,6 +80,16 @@ GlyphMesh BuildGlyphs(const OdfVolume& volume,
                       const std::vector<VoxelIndex>& voxelIndices,
                       const GlyphParams& params);
 
+// Discrete-sphere (SF) variant: `volume` holds per-direction AMPLITUDES (volume.nCoeffs
+// == sphere.vertexCount()), not SH coefficients, so the glyph radius is the amplitude
+// directly — no SH basis. `sphere` MUST be the exact sphere the amplitudes were sampled
+// on (amplitude[v] ↔ sphere.vertices[v]); e.g. discrete_sphere.hpp's Symmetric362() for
+// a 362-direction RUMBA ODF. Throws std::invalid_argument if the counts disagree.
+GlyphMesh BuildGlyphsSF(const OdfVolume& volume,
+                        const Icosphere& sphere,
+                        const std::vector<VoxelIndex>& voxelIndices,
+                        const GlyphParams& params);
+
 // Standard DTI direction-encoded color: |dir| componentwise mapped to RGB,
 // i.e. R=|x|, G=|y|, B=|z| for a unit direction (the conventional fiber
 // orientation coloring). `dir` is normalized internally. Exposed so the GPU

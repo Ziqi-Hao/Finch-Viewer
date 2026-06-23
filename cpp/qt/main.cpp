@@ -32,6 +32,14 @@ QStringList ParseQtArgs(const QStringList& argv, tracto::Args& args) {
       args.volumePath = next().toStdString();
     } else if (key == "--label") {  // integer-label / segmentation NIfTI
       args.labelPath = next().toStdString();
+    } else if (key == "--odf") {  // 4-D SH-coefficient ODF, rendered as glyphs
+      args.odfPath = next().toStdString();
+    } else if (key == "--discrete-odf") {  // sphere-sampled ODF via embedded sphere (opt-in)
+      args.discreteOdfPath = next().toStdString();
+    } else if (key == "--peaks") {  // 4-D peaks field, rendered as DEC line segments
+      args.peaksPath = next().toStdString();
+    } else if (key == "--open") {  // any file: exercise the unified auto-detect router
+      args.openPath = next().toStdString();
     } else if (key == "--display-n") {
       args.displayN = next().toInt();
     } else if (key == "--disp-step") {
@@ -40,13 +48,19 @@ QStringList ParseQtArgs(const QStringList& argv, tracto::Args& args) {
       args.seed = next().toULongLong();
     } else if (key == "--screenshot") {
       args.screenshotPath = next().toStdString();
+    } else if (key == "--window-shot") {  // full window (toolbar + docks), for UI checks
+      args.windowShotPath = next().toStdString();
+    } else if (key == "--slice-z") {  // jump the slice focus before the screenshot
+      args.sliceZ = next().toFloat();
+      args.hasSliceZ = true;
     } else if (key == "--help" || key == "-h") {
       std::cout << "Usage: local_editor_qt [--trk in.trk]... [--volume vol.nii.gz]\n"
-                << "                       [--label seg.nii.gz]\n"
+                << "                       [--label seg.nii.gz] [--odf odf.nii.gz]\n"
+                << "                       [--peaks peaks.nii.gz] [--open any.{trk,nii,nii.gz}]\n"
                 << "                       [--display-n N] [--disp-step N] [--seed N]\n"
                 << "                       [--screenshot out.png]\n"
-                << "--trk is repeatable (blend several tractograms). All optional;\n"
-                << "open/save files from the File menu too.\n";
+                << "--trk is repeatable (blend several tractograms). --open auto-detects\n"
+                << "the file type. All optional; open/save files from the File menu too.\n";
       std::exit(0);
     }
   }
@@ -79,6 +93,18 @@ int main(int argc, char** argv) {
   if (!args.labelPath.empty()) {
     window.LoadLabel(QString::fromStdString(args.labelPath));
   }
+  if (!args.odfPath.empty()) {
+    window.LoadOdf(QString::fromStdString(args.odfPath));
+  }
+  if (!args.discreteOdfPath.empty()) {
+    window.LoadDiscreteOdf(QString::fromStdString(args.discreteOdfPath));
+  }
+  if (!args.peaksPath.empty()) {
+    window.LoadPeaks(QString::fromStdString(args.peaksPath));
+  }
+  if (!args.openPath.empty()) {
+    window.DetectAndLoad(QString::fromStdString(args.openPath));  // unified auto-detect
+  }
 
   // Headless edit smoke test: delete the box and check the alive counts (CPU
   // only — no event loop needed), then exit with the verdict.
@@ -86,14 +112,23 @@ int main(int argc, char** argv) {
     return window.RunEditSelfTest() ? 0 : 2;
   }
 
-  // Headless verification: after the first frames settle, grab the viewport and
-  // exit. Lets us confirm rendering without a human watching the window.
-  if (!args.screenshotPath.empty()) {
+  // Headless verification: after the first frames settle, grab the viewport (and/or
+  // the whole window) and exit. Lets us confirm rendering/UI without a human watching.
+  if (!args.screenshotPath.empty() || !args.windowShotPath.empty()) {
     const QString shot = QString::fromStdString(args.screenshotPath);
-    QTimer::singleShot(600, &window, [&window, shot]() {
-      const bool ok = window.SaveScreenshot(shot);
-      std::cout << (ok ? "screenshot -> " : "screenshot FAILED -> ")
-                << shot.toStdString() << "\n";
+    const QString winShot = QString::fromStdString(args.windowShotPath);
+    const bool hasSliceZ = args.hasSliceZ;
+    const float sliceZ = args.sliceZ;
+    QTimer::singleShot(600, &window, [&window, shot, winShot, hasSliceZ, sliceZ]() {
+      if (hasSliceZ) window.DebugScrubToZ(sliceZ);  // jump the slice, then grab
+      if (!shot.isEmpty()) {
+        const bool ok = window.SaveScreenshot(shot);
+        std::cout << (ok ? "screenshot -> " : "screenshot FAILED -> ") << shot.toStdString() << "\n";
+      }
+      if (!winShot.isEmpty()) {
+        const bool ok = window.SaveWindowShot(winShot);
+        std::cout << (ok ? "window-shot -> " : "window-shot FAILED -> ") << winShot.toStdString() << "\n";
+      }
       QApplication::quit();
     });
   }

@@ -17,9 +17,12 @@
 #include <memory>
 #include <vector>
 
-class QAction;  // global-namespace Qt type (member pointers only)
+class QAction;  // global-namespace Qt types (member pointers only)
+class QTimer;
 
 namespace tracto {
+
+namespace odf { struct OdfVolume; }  // 4-D coefficient volume (peaks reuse the loader)
 
 class TractViewport;
 class ViewportHud;
@@ -30,14 +33,27 @@ class MainWindow : public QMainWindow {
   Q_OBJECT
  public:
   explicit MainWindow(Args args, QWidget* parent = nullptr);
+  ~MainWindow() override;  // out-of-line: unique_ptr<odf::OdfVolume> needs the full type
 
   // Load files now (used by main() for --trk / --volume on the command line).
   void LoadTractogram(const QString& path);
   void LoadVolume(const QString& path);
   void LoadLabel(const QString& path);
+  void LoadOdf(const QString& path);    // 4-D SH-coefficient ODF -> CPU glyph mesh
+  void LoadDiscreteOdf(const QString& path);  // 4-D sphere-sampled (SF) ODF -> glyphs via embedded sphere
+  void LoadPeaks(const QString& path);  // 4-D peaks field -> DEC line segments
+  // Auto-detect a file's type (extension + NIfTI header peek) and route it to the
+  // right loader. The single "Open…" entry point and the CLI both go through here.
+  void DetectAndLoad(const QString& path);
 
   // Render the viewport offscreen and write it to a PNG (for headless verify).
   bool SaveScreenshot(const QString& path);
+  // Grab the WHOLE window (toolbar + docks + viewport) to a PNG — verifies UI chrome
+  // the viewport-only SaveScreenshot can't show.
+  bool SaveWindowShot(const QString& path);
+  // Headless slice-following check: jump the slice focus to world Z and rebuild the
+  // resident ODF/peaks glyphs there (so a screenshot shows that slice).
+  void DebugScrubToZ(float z);
 
   // Headless edit smoke test: delete the viewport's current box and report the
   // alive counts (verifies the box -> selection -> aliveFull pipeline).
@@ -47,6 +63,7 @@ class MainWindow : public QMainWindow {
   void closeEvent(QCloseEvent* event) override;  // prompt if there are unsaved edits
 
  private slots:
+  void Open();        // unified entry point: pick any file, auto-detect, route
   void OpenTrk();
   void OpenVolume();
   void OpenLabel();
@@ -82,6 +99,8 @@ class MainWindow : public QMainWindow {
   void ActivateTracts(int index);           // archive the active TRK, swap in tracts_[index]
   bool AnyTractsDirty() const;              // any loaded tractogram with unsaved edits
   void LoadVolumeLayer(const QString& path, bool isLabel);  // shared volume/label loader
+  bool DisplayPeaks(const odf::OdfVolume& vol, const QString& path);  // build+show; true if sliced
+  void RebuildSliceGlyphs();  // rebuild resident ODF/peaks at the current scrub slice
   void UpdateInfo();                        // refresh the Properties basic-info readout
   void UpdateHistogram();                   // active volume -> Contrast histogram + window
   void ComputeHistogram(VolumeLayer& vl);   // bins + adaptive (robust) intensity range
@@ -146,6 +165,19 @@ class MainWindow : public QMainWindow {
   // one whose histogram/window the Contrast panel currently edits.
   std::vector<VolumeLayer> volumes_;
   int selectedVolumeId_ = -1;
+  // Layers-panel row ids for the single ODF and peaks layers (one of each; a new
+  // load replaces the old row). -1 = none loaded. Visibility toggles drive the
+  // viewport's glyph/peaks layers.
+  int odfLayerId_ = -1;
+  int peaksLayerId_ = -1;
+  // Slice-following: the loaded ODF / peaks volumes are kept resident ONLY when the
+  // scene is a single slice (whole-brain too big to draw all glyphs), so the glyphs
+  // can be rebuilt at the scrubbed slice. Reset (freed) when the scene shows whole.
+  // A debounce timer coalesces a burst of scrub events into one rebuild.
+  std::unique_ptr<odf::OdfVolume> odfVol_;
+  std::unique_ptr<odf::OdfVolume> peaksVol_;
+  bool odfIsDiscrete_ = false;  // odfVol_ is sphere-sampled (SF) -> rebuild via BuildDiscreteOdfScene
+  QTimer* sliceRebuildTimer_ = nullptr;
 
   Bounds lastBox_{};                      // last box mirrored into the panel (change detection)
   int boxStableTicks_ = 0;                // debounce: scan only after the box stops moving

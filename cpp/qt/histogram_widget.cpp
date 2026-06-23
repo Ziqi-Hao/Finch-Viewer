@@ -2,6 +2,7 @@
 
 #include "theme.hpp"
 
+#include <QFontMetrics>
 #include <QMouseEvent>
 #include <QPainter>
 
@@ -47,6 +48,14 @@ double HistogramWidget::XToVal(double x) const {
   return dataMin_ + t * (dataMax_ - dataMin_);
 }
 
+QString HistogramWidget::FormatVal(double v) const {
+  // Precision suited to the data range so the readout is informative but not noisy
+  // (e.g. FA [0,1] -> 3 dp, a T1 [0,5000] -> 0 dp).
+  const double range = dataMax_ - dataMin_;
+  const int dec = range >= 1000 ? 0 : range >= 100 ? 1 : range >= 10 ? 2 : 3;
+  return QString::number(v, 'f', dec);
+}
+
 void HistogramWidget::paintEvent(QPaintEvent*) {
   QPainter p(this);
   p.setRenderHint(QPainter::Antialiasing, false);
@@ -80,6 +89,21 @@ void HistogramWidget::paintEvent(QPaintEvent*) {
   p.setPen(QPen(QColor(theme::kAccent), 2));
   p.drawLine(xlo, 0, xlo, h);
   p.drawLine(xhi, 0, xhi, h);
+
+  // Live numeric readout at each handle so the exact window is visible while
+  // dragging (FSLeyes-style). lo at the top, hi at the bottom so a narrow band
+  // never overlaps them; each clamped to stay inside the widget.
+  QFont f = p.font();
+  f.setPointSizeF(std::max(7.5, f.pointSizeF() - 1.0));
+  p.setFont(f);
+  const QFontMetrics fm(f);
+  p.setPen(QColor(theme::kText));
+  const QString loTxt = FormatVal(lo_), hiTxt = FormatVal(hi_);
+  const int loX = std::clamp(xlo + 3, kMargin, w - kMargin - fm.horizontalAdvance(loTxt));
+  const int hiX = std::clamp(xhi - 3 - fm.horizontalAdvance(hiTxt), kMargin,
+                             w - kMargin - fm.horizontalAdvance(hiTxt));
+  p.drawText(loX, fm.ascent() + 1, loTxt);          // top
+  p.drawText(hiX, h - fm.descent() - 1, hiTxt);     // bottom
 }
 
 void HistogramWidget::mousePressEvent(QMouseEvent* event) {

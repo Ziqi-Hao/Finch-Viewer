@@ -27,6 +27,73 @@ Vec3 DirectionColor(Vec3 dir) {
   return {std::fabs(u.x), std::fabs(u.y), std::fabs(u.z)};
 }
 
+namespace {
+
+// FLOAT_EPS matches shfield_comp.glsl:25 — rejects degenerate triangle edges so a
+// collapsed lobe (radius ~ 0) does not inject NaN normals.
+constexpr float kEdgeEps = 1e-4f;
+
+// Deform one glyph from a per-direction `radius` buffer and write its vertices,
+// accumulated normals, colors, and triangle indices into the packed mesh. Shared by
+// the SH builder (radius = SH reconstruction) and the SF builder (radius = the file's
+// amplitudes) — only the radius SOURCE differs, so the deform/normal/index math lives
+// here once. Steps mirror shfield_comp.glsl:64-95 + shfield_vert.glsl:59-86.
+void EmitGlyphFromRadii(GlyphMesh& mesh, const Icosphere& sphere, const Vec3& voxelWorld,
+                        const std::vector<float>& radius, float radiusScale,
+                        std::size_t vertexBase, std::size_t indexBase) {
+  const std::size_t nDir = sphere.vertexCount();
+  const std::size_t idxPerGlyph = sphere.indices.size();
+
+  // 1) Deform the unit sphere radially and place it at the voxel centre. Keep the
+  //    deformed offset (glyph-local) for the normal pass — nicer numerically than
+  //    differencing large world coords. Color = direction-encoded fiber color; since
+  //    radius >= 0, normalize(offset) == the unit sample direction.
+  for (std::size_t v = 0; v < nDir; ++v) {
+    const Vec3 dir = sphere.vertices[v];
+    mesh.positions[vertexBase + v] = voxelWorld + dir * (radius[v] * radiusScale);
+    mesh.colors[vertexBase + v] = DirectionColor(dir);
+  }
+
+  // 2) Recompute per-vertex normals from the DEFORMED surface: accumulate each
+  //    triangle's face normal into its three vertices (normalized once by the caller).
+  for (std::size_t t = 0; t < idxPerGlyph; t += 3) {
+    const unsigned i0 = sphere.indices[t], i1 = sphere.indices[t + 1], i2 = sphere.indices[t + 2];
+    const Vec3 a = mesh.positions[vertexBase + i0];
+    const Vec3 b = mesh.positions[vertexBase + i1];
+    const Vec3 c = mesh.positions[vertexBase + i2];
+    Vec3 ab = b - a, ac = c - a;
+    if (Length(ab) > kEdgeEps && Length(ac) > kEdgeEps) {  // skip collapsed lobes
+      ab = Normalize(ab);
+      ac = Normalize(ac);
+      if (std::fabs(Dot(ab, ac)) < 1.0f) {  // not (anti)parallel
+        const Vec3 n = Normalize(Cross(ab, ac));
+        mesh.normals[vertexBase + i0] = mesh.normals[vertexBase + i0] + n;
+        mesh.normals[vertexBase + i1] = mesh.normals[vertexBase + i1] + n;
+        mesh.normals[vertexBase + i2] = mesh.normals[vertexBase + i2] + n;
+      }
+    }
+  }
+
+  // 3) Emit this glyph's triangle indices, offset into the packed arrays.
+  for (std::size_t t = 0; t < idxPerGlyph; ++t) {
+    mesh.indices[indexBase + t] = static_cast<unsigned>(vertexBase) + sphere.indices[t];
+  }
+}
+
+// Allocate the packed mesh for `glyphCount` glyphs of a shared sphere; returns false
+// (empty mesh) when there is nothing to draw.
+bool SizeGlyphMesh(GlyphMesh& mesh, const Icosphere& sphere, std::size_t glyphCount) {
+  if (glyphCount == 0 || sphere.vertexCount() == 0 || sphere.indices.empty()) return false;
+  const std::size_t totalVerts = glyphCount * sphere.vertexCount();
+  mesh.positions.resize(totalVerts);
+  mesh.normals.assign(totalVerts, Vec3{0.0f, 0.0f, 0.0f});  // accumulated in EmitGlyphFromRadii
+  mesh.colors.resize(totalVerts);
+  mesh.indices.resize(glyphCount * sphere.indices.size());
+  return true;
+}
+
+}  // namespace
+
 GlyphMesh BuildGlyphs(const OdfVolume& volume,
                       const Icosphere& icosphere,
                       const ShBasisMatrix& basisMatrix,
@@ -48,139 +115,73 @@ GlyphMesh BuildGlyphs(const OdfVolume& volume,
   }
 
   GlyphMesh mesh;
-  if (voxelIndices.empty() || nDir == 0 || icosphere.indices.empty()) {
-    return mesh;  // nothing to draw
-  }
+  if (!SizeGlyphMesh(mesh, icosphere, voxelIndices.size())) return mesh;  // nothing to draw
 
-  // Every glyph contributes the same vertex/index counts (the shared icosphere,
-  // only deformed radially), so we can size the output exactly up front.
-  const std::size_t glyphCount = voxelIndices.size();
-  const std::size_t idxPerGlyph = icosphere.indices.size();
-  const std::size_t totalVerts = glyphCount * nDir;
-  const std::size_t totalIdx = glyphCount * idxPerGlyph;
+  std::vector<float> radius(nDir, 0.0f);     // scratch, reused per glyph
+  const std::size_t coeffStride = volume.voxelCount();  // coeffs are OUTERMOST
 
-  mesh.positions.resize(totalVerts);
-  mesh.normals.assign(totalVerts, Vec3{0.0f, 0.0f, 0.0f});  // accumulated below
-  mesh.colors.resize(totalVerts);
-  mesh.indices.resize(totalIdx);
-
-  // Scratch radius buffer reused per glyph (avoids reallocating per voxel).
-  std::vector<float> radius(nDir, 0.0f);
-
-  // FLOAT_EPS matches shfield_comp.glsl:25 — used to reject degenerate triangle
-  // edges so a collapsed lobe (radius ~ 0) does not inject NaN normals.
-  constexpr float kEdgeEps = 1e-4f;
-
-  for (std::size_t g = 0; g < glyphCount; ++g) {
+  for (std::size_t g = 0; g < voxelIndices.size(); ++g) {
     const VoxelIndex& vox = voxelIndices[g];
-    const float* coeff = volume.voxelCoeffs(vox);  // coeff-outermost stride
+    const float* coeff = volume.voxelCoeffs(vox);
     const std::size_t vertexBase = g * nDir;
-    const std::size_t indexBase = g * idxPerGlyph;
 
-    // --- 1) Reconstruct radius per direction: radius[v] = sum_c coeff[c]*B[v][c]
-    //         then clamp negatives, and track the per-glyph max amplitude.
-    // NOTE on the coefficient stride: OdfVolume stores coefficients OUTERMOST
-    // (coeff c of voxel is `coeff[c * voxelCount]`), so we step by voxelCount,
-    // not by 1. The basis row is contiguous (one row per direction).
-    const std::size_t coeffStride = volume.voxelCount();
+    // Radius per direction = SH reconstruction sum_c coeff[c]*B[v][c]; clamp negative
+    // lobes (a lobe where the SH sum dips below zero is just absent), track the max.
     float maxAmp = 0.0f;
     for (std::size_t v = 0; v < nDir; ++v) {
       const float* b = basisMatrix.row(v);
       float r = 0.0f;
-      for (std::size_t c = 0; c < nCoeffs; ++c) {
-        r += coeff[c * coeffStride] * b[c];
-      }
-      // A glyph radius cannot be negative (a lobe where the SH sum dips below
-      // zero is just absent). Clamp before tracking the max so normalization is
-      // by the largest *visible* lobe. clampNegative is exposed for a future
-      // signed mode that wants the raw value.
-      if (params.clampNegative && r < 0.0f) {
-        r = 0.0f;
-      }
+      for (std::size_t c = 0; c < nCoeffs; ++c) r += coeff[c * coeffStride] * b[c];
+      if (params.clampNegative && r < 0.0f) r = 0.0f;
       radius[v] = r;
-      if (r > maxAmp) {
-        maxAmp = r;
-      }
+      if (r > maxAmp) maxAmp = r;
     }
+    // Per-glyph normalize (shfield_vert.glsl:84-86): divide by the max so glyphs reach
+    // the same nominal size; maxAmp<=0 (empty glyph) leaves it unnormalized.
+    const float normFactor = (params.normalizePerGlyph && maxAmp > 0.0f) ? 1.0f / maxAmp : 1.0f;
+    EmitGlyphFromRadii(mesh, icosphere, VoxelToWorld(volume.affine, vox), radius,
+                       normFactor * params.scale, vertexBase, g * icosphere.indices.size());
+  }
 
-    // Per-glyph normalization factor (shfield_vert.glsl:84-86). When enabled,
-    // divide every radius by this glyph's max so all glyphs reach the same
-    // nominal size (shape comparison). maxAmp <= 0 means the glyph is empty;
-    // guard against divide-by-zero by leaving it unnormalized (matches the
-    // reference's `maxAmplitude > 0 ? maxAmplitude : 1.0`).
-    float normFactor = 1.0f;
-    if (params.normalizePerGlyph && maxAmp > 0.0f) {
-      normFactor = 1.0f / maxAmp;
-    }
-    const float radiusScale = normFactor * params.scale;
+  for (Vec3& n : mesh.normals) n = Normalize(n);  // smooth shading, normalize once
+  return mesh;
+}
 
-    // --- 2) Deform the shared unit sphere and place it at the voxel's world
-    //         position. deformed = unitDir * radius * radiusScale; world pos =
-    //         VoxelToWorld(affine, voxel) + deformed. We keep the deformed
-    //         OFFSET (relative to the voxel center) around for the normal/color
-    //         pass so geometry math is in glyph-local space (numerically nicer
-    //         than differencing large world coordinates).
-    const Vec3 voxelWorld = VoxelToWorld(volume.affine, vox);
+GlyphMesh BuildGlyphsSF(const OdfVolume& volume,
+                        const Icosphere& sphere,
+                        const std::vector<VoxelIndex>& voxelIndices,
+                        const GlyphParams& params) {
+  // Discrete-sphere (SF) glyphs: the volume stores per-direction AMPLITUDES (one per
+  // `sphere` vertex), not SH coefficients — so the radius IS the amplitude, no basis
+  // matvec. `sphere` must be the exact sphere the amplitudes were sampled on (its order
+  // matters: amplitude[v] belongs to sphere.vertices[v]). Everything downstream (deform,
+  // normals, color, indices) is identical to the SH path via EmitGlyphFromRadii.
+  const std::size_t nDir = sphere.vertexCount();
+  if (static_cast<std::size_t>(volume.nCoeffs) != nDir) {
+    throw std::invalid_argument("BuildGlyphsSF: volume.nCoeffs != sphere.vertexCount()");
+  }
+  GlyphMesh mesh;
+  if (!SizeGlyphMesh(mesh, sphere, voxelIndices.size())) return mesh;
+
+  std::vector<float> radius(nDir, 0.0f);
+  const std::size_t ampStride = volume.voxelCount();  // amplitudes are OUTERMOST too
+
+  for (std::size_t g = 0; g < voxelIndices.size(); ++g) {
+    const VoxelIndex& vox = voxelIndices[g];
+    const float* amp = volume.voxelCoeffs(vox);  // amplitude v at amp[v * ampStride]
+    float maxAmp = 0.0f;
     for (std::size_t v = 0; v < nDir; ++v) {
-      const Vec3 dir = icosphere.vertices[v];
-      const Vec3 offset = dir * (radius[v] * radiusScale);
-      mesh.positions[vertexBase + v] = voxelWorld + offset;
-      // Color is the direction-encoded fiber color of the (unit) sample
-      // direction. Since radius >= 0 after clamp, the deformed offset has the
-      // same sign as dir, so normalize(offset) == dir; using dir directly is
-      // equivalent and well-defined even when radius == 0 (matches
-      // shfield_vert.glsl's abs(normalize(scaledVertice))).
-      mesh.colors[vertexBase + v] = DirectionColor(dir);
+      float r = amp[v * ampStride];
+      if (params.clampNegative && r < 0.0f) r = 0.0f;  // ODF amplitudes are >= 0 anyway
+      radius[v] = r;
+      if (r > maxAmp) maxAmp = r;
     }
-
-    // --- 3) Recompute per-vertex normals from the DEFORMED surface
-    //         (shfield_comp.glsl:64-95). Accumulate each triangle's face normal
-    //         into its three vertices, then normalize once at the end. The
-    //         per-glyph uniform scale (radiusScale) does not change normal
-    //         DIRECTION, so we use the deformed offsets directly.
-    for (std::size_t t = 0; t < idxPerGlyph; t += 3) {
-      const unsigned i0 = icosphere.indices[t];
-      const unsigned i1 = icosphere.indices[t + 1];
-      const unsigned i2 = icosphere.indices[t + 2];
-
-      const Vec3 a = mesh.positions[vertexBase + i0];
-      const Vec3 b = mesh.positions[vertexBase + i1];
-      const Vec3 c = mesh.positions[vertexBase + i2];
-
-      Vec3 ab = b - a;
-      Vec3 ac = c - a;
-      // Skip degenerate triangles (collapsed lobe): a zero-length edge or two
-      // (anti)parallel edges give a zero cross product whose Normalize would
-      // hand back {0,0,0} — accumulating that is a no-op, but the explicit
-      // guard also avoids NaN from normalizing a zero edge. Mirrors the
-      // reference's length/dot checks (shfield_comp.glsl:82-87).
-      if (Length(ab) > kEdgeEps && Length(ac) > kEdgeEps) {
-        ab = Normalize(ab);
-        ac = Normalize(ac);
-        if (std::fabs(Dot(ab, ac)) < 1.0f) {  // not (anti)parallel
-          const Vec3 n = Normalize(Cross(ab, ac));
-          mesh.normals[vertexBase + i0] = mesh.normals[vertexBase + i0] + n;
-          mesh.normals[vertexBase + i1] = mesh.normals[vertexBase + i1] + n;
-          mesh.normals[vertexBase + i2] = mesh.normals[vertexBase + i2] + n;
-        }
-      }
-    }
-
-    // --- 4) Emit this glyph's triangle indices, offset into the packed arrays.
-    for (std::size_t t = 0; t < idxPerGlyph; ++t) {
-      mesh.indices[indexBase + t] =
-          static_cast<unsigned>(vertexBase) + icosphere.indices[t];
-    }
+    const float normFactor = (params.normalizePerGlyph && maxAmp > 0.0f) ? 1.0f / maxAmp : 1.0f;
+    EmitGlyphFromRadii(mesh, sphere, VoxelToWorld(volume.affine, vox), radius,
+                       normFactor * params.scale, g * nDir, g * sphere.indices.size());
   }
 
-  // --- 5) Normalize accumulated vertex normals once (smooth shading). A vertex
-  //         touched by no valid triangle keeps {0,0,0}; Normalize leaves it
-  //         {0,0,0} rather than producing NaN, which a shader treats as an
-  //         unlit/black normal — acceptable for an empty/degenerate glyph.
-  for (Vec3& n : mesh.normals) {
-    n = Normalize(n);
-  }
-
+  for (Vec3& n : mesh.normals) n = Normalize(n);
   return mesh;
 }
 

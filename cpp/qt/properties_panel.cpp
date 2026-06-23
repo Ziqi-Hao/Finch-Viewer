@@ -96,14 +96,49 @@ PropertiesPanel::PropertiesPanel(const EditActions& actions, QWidget* parent)
   }
   root->addWidget(display);
 
-  // ── Contrast: volume intensity histogram with draggable grayscale window. ──
+  // ── Contrast: volume intensity histogram with draggable grayscale window, plus
+  // editable Low/High fields + a data-range readout so the exact numbers are
+  // always visible and directly typeable (FSLeyes/Freeview-style). ──────────────
   contrastCard_ = Card("Contrast");
   {
     auto* layout = new QVBoxLayout(contrastCard_);
     histogram_ = new HistogramWidget;
-    connect(histogram_, &HistogramWidget::rangeChanged, this,
-            &PropertiesPanel::contrastRangeChanged);
     layout->addWidget(histogram_);
+
+    contrastLo_ = new QDoubleSpinBox;
+    contrastHi_ = new QDoubleSpinBox;
+    for (QDoubleSpinBox* s : {contrastLo_, contrastHi_}) {
+      s->setKeyboardTracking(false);  // emit on Enter/focus-out, not every keystroke
+      s->setMinimumWidth(76);
+    }
+    auto* row = new QHBoxLayout;
+    row->addWidget(new QLabel("Low"));
+    row->addWidget(contrastLo_, 1);
+    row->addSpacing(10);
+    row->addWidget(new QLabel("High"));
+    row->addWidget(contrastHi_, 1);
+    layout->addLayout(row);
+
+    contrastRangeLabel_ = new QLabel;
+    contrastRangeLabel_->setObjectName("hintLabel");  // muted style if the theme has it
+    layout->addWidget(contrastRangeLabel_);
+
+    // Drag the histogram -> reflect into the fields (no echo) + bubble the change up.
+    connect(histogram_, &HistogramWidget::rangeChanged, this, [this](double lo, double hi) {
+      QSignalBlocker bl(contrastLo_), bh(contrastHi_);
+      contrastLo_->setValue(lo);
+      contrastHi_->setValue(hi);
+      emit contrastRangeChanged(lo, hi);
+    });
+    // Type a field -> move the histogram window + bubble up (keep lo <= hi).
+    auto onSpin = [this] {
+      double lo = contrastLo_->value(), hi = contrastHi_->value();
+      if (hi < lo) std::swap(lo, hi);
+      histogram_->SetRange(lo, hi);  // reflects without re-emitting
+      emit contrastRangeChanged(lo, hi);
+    };
+    connect(contrastLo_, &QDoubleSpinBox::editingFinished, this, onSpin);
+    connect(contrastHi_, &QDoubleSpinBox::editingFinished, this, onSpin);
   }
   root->addWidget(contrastCard_);
 
@@ -228,6 +263,22 @@ void PropertiesPanel::SetHistogram(bool hasVolume, std::vector<float> bins, doub
   if (!hasVolume) return;
   histogram_->SetHistogram(std::move(bins), dataMin, dataMax);
   histogram_->SetRange(lo, hi);
+
+  // Match the spinbox precision/step/range to the data, then reflect the window.
+  const double range = dataMax - dataMin;
+  const int dec = range >= 1000 ? 0 : range >= 100 ? 1 : range >= 10 ? 2 : 3;
+  const double step = std::max(1e-6, range / 100.0);
+  for (QDoubleSpinBox* s : {contrastLo_, contrastHi_}) {
+    QSignalBlocker block(s);
+    s->setDecimals(dec);
+    s->setRange(dataMin, dataMax);
+    s->setSingleStep(step);
+  }
+  { QSignalBlocker bl(contrastLo_); contrastLo_->setValue(lo); }
+  { QSignalBlocker bh(contrastHi_); contrastHi_->setValue(hi); }
+  contrastRangeLabel_->setText(QString("data range  %1 – %2")
+                                  .arg(QString::number(dataMin, 'f', dec),
+                                       QString::number(dataMax, 'f', dec)));
 }
 
 void PropertiesPanel::SetEditMode(bool on) {

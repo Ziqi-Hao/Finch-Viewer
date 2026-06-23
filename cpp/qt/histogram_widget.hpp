@@ -5,6 +5,7 @@
 // shaded band between the handles is what maps to black..white; drag a handle (or
 // the band) to adjust. Emits rangeChanged(lo, hi) in data units. Pure view.
 
+#include <QString>
 #include <QWidget>
 
 #include <vector>
@@ -31,6 +32,7 @@ class HistogramWidget : public QWidget {
  private:
   double ValToX(double v) const;  // data value -> pixel x
   double XToVal(double x) const;  // pixel x -> data value (clamped to data range)
+  QString FormatVal(double v) const;  // value -> string at a precision suited to the range
 
   std::vector<float> bins_;
   double dataMin_ = 0.0, dataMax_ = 1.0;

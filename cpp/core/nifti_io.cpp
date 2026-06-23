@@ -309,4 +309,38 @@ Bounds WorldBounds(const Volume& v) {
   return b;
 }
 
+NiftiInfo PeekNifti(const std::string& path) {
+  // Header-only and non-throwing (the router calls it speculatively to classify a
+  // file): any failure just returns ok=false and the caller falls back. Reuses the
+  // same offsets + endian detection as LoadNifti so the two never disagree.
+  NiftiInfo info;
+  gzFile f = gzopen(path.c_str(), "rb");  // transparently reads plain .nii too
+  if (!f) return info;
+  char hdr[kHeaderSize];
+  const bool full = gzread(f, hdr, kHeaderSize) == kHeaderSize;
+  gzclose(f);
+  if (!full) return info;
+
+  int32_t sizeofHdr;
+  std::memcpy(&sizeofHdr, hdr, 4);
+  bool swap = false;
+  if (sizeofHdr != kHeaderSize) {
+    if (static_cast<int32_t>(Swap32(static_cast<uint32_t>(sizeofHdr))) == kHeaderSize)
+      swap = true;
+    else
+      return info;  // not a NIfTI-1 (NIfTI-2 / .hdr-img / garbage)
+  }
+  if (std::memcmp(hdr + kOffMagic, "n+1", 3) != 0) return info;
+
+  const HeaderReader h{hdr, swap};
+  const int ndim = h.I16(kOffDim);
+  if (ndim < 1 || ndim > 7) return info;
+  info.ndim = ndim;
+  for (int d = 0; d <= 7; ++d) info.dim[d] = h.I16(kOffDim + 2 * d);
+  info.dim[0] = ndim;  // dim[0] holds the dimensionality, not a size
+  info.datatype = h.I16(kOffDatatype);
+  info.ok = true;
+  return info;
+}
+
 }  // namespace tracto

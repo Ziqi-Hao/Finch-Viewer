@@ -53,6 +53,26 @@ class TractViewport : public QRhiWidget {
   // Drawn alongside the active one so several tractograms can show at once.
   void SetTractOverlays(std::vector<std::vector<float>> overlays);
 
+  // ODF glyph mesh (indexed, lit triangles). MainWindow builds it on load from a
+  // SH-coefficient volume (cpp/odf) and hands over an interleaved
+  // [pos.xyz, normal.xyz, rgb] vertex buffer + a uint32 triangle index list, plus
+  // the glyph world (RAS) bounds for framing an ODF-only scene. Drawn opaque in the
+  // 3-D pane. Pass empty vectors to clear. Safe before the rhi exists (defers upload).
+  void SetGlyphGeometry(std::vector<float> interleaved, std::vector<std::uint32_t> indices,
+                        const Bounds& bounds);
+  void SetGlyphsVisible(bool visible);  // hide/show the glyph layer
+  bool GlyphsVisible() const { return showGlyphs_; }
+  bool HasGlyphs() const { return hasGlyphs_; }
+
+  // Peaks field (per-voxel principal directions) drawn as DEC-coloured line
+  // segments. MainWindow builds the segment buffer ([pos.xyz, rgb], 2 verts/segment)
+  // on load; this reuses the line pipeline (one VBO, one draw — no new pipeline).
+  // Pass an empty buffer to clear. Safe before the rhi exists (defers upload).
+  void SetPeaksGeometry(std::vector<float> interleaved, const Bounds& bounds);
+  void SetPeaksVisible(bool visible);  // hide/show the peaks layer
+  bool PeaksVisible() const { return showPeaks_; }
+  bool HasPeaks() const { return hasPeaks_; }
+
   // Provide a full-set in-box query (MainWindow binds its selection backend).
   // Drives the live white highlight of the streamlines inside the box.
   void SetSelectionQuery(std::function<std::vector<uint8_t>(const Bounds&)> query);
@@ -89,7 +109,21 @@ class TractViewport : public QRhiWidget {
   void ResetSelectionBox();                 // re-place inside the current data bounds
   void SetSelectionBox(const Bounds& box);  // set the box from numeric input (panel)
 
-  void ResetCamera();
+  void ResetCamera();            // re-frame ALL four panes + recentre the slice focus
+  void ResetView(int pane);      // re-frame just one pane (pane<0 -> all, = ResetCamera)
+  void ResetHoveredView();       // re-frame the pane under the cursor (R key); all if none
+
+  // Shared slice-crosshair position (world RAS mm). MainWindow reads it to rebuild
+  // slice-following ODF/peaks glyphs when the user scrubs.
+  Vec3 SliceFocus() const { return focus_; }
+  // Jump the slice focus to a world Z and lock it (used for headless verification of
+  // slice-following; equivalent to scrubbing the axial pane there).
+  void SetSliceFocusZ(float z);
+
+ signals:
+  void sliceFocusChanged();  // the slice crosshair moved (arrow scrub / slice-plane drag)
+
+ public:
 
   // RHI device + backend name (e.g. "Apple M4 Pro · Metal") for the perf overlay;
   // empty until the rhi exists. Lives here because rhi() is protected.
@@ -137,6 +171,10 @@ class TractViewport : public QRhiWidget {
   // else world axis 0/1/2). Used to grab + slide a plane along its normal.
   int PickSlicePlane(const QPoint& pos) const;
 
+  // The bounds the cameras frame on, in priority order: volume > streamlines >
+  // glyphs > peaks. Shared by ResetCamera / ResetView so they agree.
+  const Bounds& FramingBounds() const;
+
   // ── 2x2 multi-view layout (one QRhi, four sub-viewports). ─────────────────
   static ViewKind PaneKind(int i);     // pane index 0..3 -> kind (cell order)
   static int PaneAxis(int i);          // -1 for the 3D pane, else 0=X 1=Y 2=Z
@@ -175,6 +213,22 @@ class TractViewport : public QRhiWidget {
   std::function<std::vector<uint8_t>(const Bounds&)> selectionQuery_;  // full-set in-box mask
   QElapsedTimer highlightClock_;           // throttles the recompute during a drag
   qint64 lastHighlightMs_ = -1000;
+
+  // ── ODF glyph layer (indexed lit triangles; mesh built CPU-side by MainWindow
+  // from the SH-coefficient volume, then handed over whole like the line buffer). ─
+  std::vector<float> glyphData_;             // [pos.xyz, normal.xyz, rgb] * vertices
+  std::vector<std::uint32_t> glyphIndices_;  // triangle list into glyphData_
+  Bounds glyphBounds_;                       // world (RAS) bounds of the glyph mesh
+  bool hasGlyphs_ = false;
+  bool showGlyphs_ = true;
+  bool glyphDirty_ = false;                  // re-upload the VBO + IBO in render()
+
+  // ── Peaks layer (DEC-coloured line segments; reuses the line pipeline). ──────
+  std::vector<float> peaksData_;   // [pos.xyz, rgb] * vertices (Lines, 2 verts/segment)
+  Bounds peaksBounds_;             // world (RAS) bounds of the peaks segments
+  bool hasPeaks_ = false;
+  bool showPeaks_ = true;
+  bool peaksDirty_ = false;        // re-upload the peaks VBO in render()
 
   // Read-only overlay tractograms (visible bundles other than the active one).
   // Each is a static [pos.xyz, rgb] line buffer drawn with the line pipeline; no
@@ -269,6 +323,20 @@ class TractViewport : public QRhiWidget {
   QRhiGraphicsPipeline* highlightPs_ = nullptr;  // Lines, no depth (white selection on top)
   QRhiGraphicsPipeline* pointPs_ = nullptr;  // Points, no depth (handles on top)
   QRhiGraphicsPipeline* slicePs_ = nullptr;  // Triangles, alpha blend, depth no-write
+
+  // ODF glyph layer: indexed lit triangles ([pos,normal,rgb], own UBO mvp+light).
+  QRhiBuffer* glyphVbo_ = nullptr;
+  QRhiBuffer* glyphIbo_ = nullptr;
+  QRhiBuffer* glyphUbo_ = nullptr;   // mat4 mvp + vec4 lightDir, one block per pane
+  QRhiShaderResourceBindings* glyphSrb_ = nullptr;
+  QRhiGraphicsPipeline* glyphPs_ = nullptr;  // Triangles, depth test+write, two-sided lit
+  std::size_t glyphVboCap_ = 0, glyphIboCap_ = 0;
+  std::size_t glyphVertexCount_ = 0, glyphIndexCount_ = 0;
+  quint32 glyphUboStride_ = 0;
+
+  // Peaks layer: line segments drawn with linePs_/lineSrb_/lineUbo_ (own VBO only).
+  QRhiBuffer* peaksVbo_ = nullptr;
+  std::size_t peaksVboCap_ = 0, peaksVertexCount_ = 0;
 
   // Capacities currently allocated on the GPU; a grow re-creates the buffer.
   std::size_t lineVboCap_ = 0;

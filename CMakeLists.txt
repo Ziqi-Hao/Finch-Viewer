@@ -49,6 +49,21 @@ if(BUILD_TESTING)
   add_test(NAME core_selftest COMMAND core_selftest)
 endif()
 
+# ── ODF foundation: pure-CPU SH-coefficient ODF load + glyph mesh build ──────
+# Deliberately standalone (its own NIfTI parse + private math types; zlib + C++17
+# stdlib only — no VTK, no Qt, no GL) so it stays unit-testable and reusable. Kept
+# a separate lib from tracto_core to preserve that boundary; the Qt editor links
+# both. See cpp/odf/odf_types.hpp for why the types are namespaced tracto::odf.
+add_library(tracto_odf STATIC
+  cpp/odf/odf_volume.cpp
+  cpp/odf/sh_basis.cpp
+  cpp/odf/icosphere.cpp
+  cpp/odf/glyph_builder.cpp
+  cpp/odf/discrete_sphere.cpp
+)
+target_include_directories(tracto_odf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/odf)
+target_link_libraries(tracto_odf PUBLIC ZLIB::ZLIB)
+
 # ── vendored GL loader + GLFW (for the GLFW viewer / probe) ──────────────────
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -94,7 +109,8 @@ if(Qt6_FOUND)
   endif()
 
   set(QT_RHI_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cpp/qt/rhi)
-  set(QT_RHI_SHADERS line.vert line.frag point.vert slice.vert slice.frag)
+  set(QT_RHI_SHADERS line.vert line.frag point.vert slice.vert slice.frag
+                     glyph.vert glyph.frag)
   set(QT_RHI_QSB_DIR ${CMAKE_CURRENT_BINARY_DIR}/qt_shaders)
   file(MAKE_DIRECTORY ${QT_RHI_QSB_DIR})
 
@@ -143,6 +159,7 @@ if(Qt6_FOUND)
   set_target_properties(local_editor_qt PROPERTIES AUTOMOC ON AUTORCC ON)
   target_link_libraries(local_editor_qt PRIVATE
     tracto_core
+    tracto_odf
     Qt6::Gui
     Qt6::Widgets
     Qt6::GuiPrivate

@@ -29,6 +29,20 @@ struct Volume {
 // malformed file or an unsupported variant (NIfTI-2, .hdr/.img pairs).
 Volume LoadNifti(const std::string& path);
 
+// Lightweight header-only peek: parses just the 348-byte NIfTI-1 header (no voxel
+// read) to expose the shape + datatype. Used by the unified "Open…" router to tell
+// a 3-D scalar volume from a 4-D SH-coefficient ODF or a peaks field WITHOUT loading
+// the (possibly huge) data. Never throws — `ok` is false if the file is not a
+// parseable NIfTI-1. dim[0] is the dimensionality; dim[1..3] are spatial; dim[4] is
+// the 4th-axis length (SH coefficient count for ODFs, 3·Npeaks for peaks).
+struct NiftiInfo {
+  bool ok = false;
+  int ndim = 0;          // dim[0]
+  int dim[8] = {0};      // dim[0..7] in header order
+  int datatype = 0;      // NIfTI datatype code (DT_FLOAT32 = 16, etc.)
+};
+NiftiInfo PeekNifti(const std::string& path);
+
 // World-space (RAS mm) axis-aligned bounds of the volume's voxel grid, i.e. the
 // 8 corners of [0..nx-1]x[0..ny-1]x[0..nz-1] under voxelToWorld.
 Bounds WorldBounds(const Volume& volume);

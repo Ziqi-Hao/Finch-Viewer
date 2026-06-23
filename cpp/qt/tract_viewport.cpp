@@ -33,9 +33,14 @@ struct SliceUbo {
   float invDims[4];      // xyz = 1/dims
   float valueParams[4];  // x = valueMin, y = valueRange
 };
+struct GlyphUbo {
+  float mvp[16];
+  float lightDir[4];  // xyz = world-space directional light; w unused
+};
 static_assert(sizeof(LineUbo) == 64, "LineUbo std140 size");
 static_assert(sizeof(PointUbo) == 80, "PointUbo std140 size");
 static_assert(sizeof(SliceUbo) == 160, "SliceUbo std140 size");
+static_assert(sizeof(GlyphUbo) == 80, "GlyphUbo std140 size");
 
 QShader LoadShader(const QString& path) {
   QFile f(path);
@@ -117,6 +122,41 @@ void TractViewport::SetTractOverlays(std::vector<std::vector<float>> overlays) {
   update();
 }
 
+void TractViewport::SetGlyphGeometry(std::vector<float> interleaved,
+                                     std::vector<std::uint32_t> indices,
+                                     const Bounds& bounds) {
+  // Geometry only — like SetLineGeometry it does NOT re-frame the camera (the
+  // MainWindow calls ResetCamera explicitly on a fresh load). Empty input clears
+  // the layer. The upload is deferred to render() via glyphDirty_, so this is safe
+  // before the rhi device exists.
+  glyphData_ = std::move(interleaved);
+  glyphIndices_ = std::move(indices);
+  glyphBounds_ = bounds;
+  hasGlyphs_ = !glyphData_.empty() && !glyphIndices_.empty();
+  glyphDirty_ = true;
+  update();
+}
+
+void TractViewport::SetGlyphsVisible(bool visible) {
+  showGlyphs_ = visible;
+  update();
+}
+
+void TractViewport::SetPeaksGeometry(std::vector<float> interleaved, const Bounds& bounds) {
+  // [pos.xyz, rgb] line segments, same layout as the streamlines — drawn with the
+  // line pipeline. Geometry only (no camera re-frame); empty input clears the layer.
+  peaksData_ = std::move(interleaved);
+  peaksBounds_ = bounds;
+  hasPeaks_ = !peaksData_.empty();
+  peaksDirty_ = true;
+  update();
+}
+
+void TractViewport::SetPeaksVisible(bool visible) {
+  showPeaks_ = visible;
+  update();
+}
+
 void TractViewport::SetSelectionQuery(std::function<std::vector<uint8_t>(const Bounds&)> query) {
   selectionQuery_ = std::move(query);
   UpdateHighlight();
@@ -145,11 +185,42 @@ void TractViewport::UpdateHighlight() {
   update();
 }
 
+const Bounds& TractViewport::FramingBounds() const {
+  // Priority: a background volume (its extent drives the view), else the
+  // streamlines, else an ODF-only glyph or peaks-only scene.
+  return hasVolumeBounds_      ? volumeBounds_
+         : !lineData_.empty()  ? bounds_
+         : hasGlyphs_          ? glyphBounds_
+         : hasPeaks_           ? peaksBounds_
+                               : bounds_;
+}
+
 void TractViewport::ResetCamera() {
-  // Frame on the volume bounds when a volume is loaded (the user wants the volume
-  // extent to drive the view), else on the streamline/data bounds.
-  camera_.Frame(hasVolumeBounds_ ? volumeBounds_ : bounds_);
-  focusInit_ = false;  // re-centre the shared focus + re-fit the ortho panes on new data
+  // Global reset: re-frame the 3-D orbit AND re-centre the shared slice focus +
+  // re-fit all three ortho panes (the focusInit block in render() does the latter).
+  camera_.Frame(FramingBounds());
+  focusInit_ = false;
+  update();
+}
+
+void TractViewport::ResetView(int pane) {
+  // Per-pane reset: re-frame just one pane's camera, leaving the others and the
+  // shared slice position alone. pane<0 means "no specific pane" -> reset everything.
+  if (pane < 0) { ResetCamera(); return; }
+  const Bounds& fb = FramingBounds();
+  const int axis = PaneAxis(pane);
+  if (axis < 0) camera_.Frame(fb);          // 3-D orbit pane
+  else ortho_[axis].Frame(fb, axis);        // one ortho pane's pan + zoom
+  update();
+}
+
+void TractViewport::ResetHoveredView() { ResetView(hoverPane_); }
+
+void TractViewport::SetSliceFocusZ(float z) {
+  focus_.z = z;
+  focusInit_ = true;      // lock the focus so render()'s lazy re-centre won't override it
+  focusDirty_ = true;     // slice quads follow
+  emit sliceFocusChanged();
   update();
 }
 
@@ -604,8 +675,10 @@ void TractViewport::CreateResources() {
   const QShader pointVs = LoadShader(QStringLiteral(":/shaders/point.vert.qsb"));
   const QShader sliceVs = LoadShader(QStringLiteral(":/shaders/slice.vert.qsb"));
   const QShader sliceFs = LoadShader(QStringLiteral(":/shaders/slice.frag.qsb"));
+  const QShader glyphVs = LoadShader(QStringLiteral(":/shaders/glyph.vert.qsb"));
+  const QShader glyphFs = LoadShader(QStringLiteral(":/shaders/glyph.frag.qsb"));
   if (!lineVs.isValid() || !lineFs.isValid() || !pointVs.isValid() ||
-      !sliceVs.isValid() || !sliceFs.isValid()) {
+      !sliceVs.isValid() || !sliceFs.isValid() || !glyphVs.isValid() || !glyphFs.isValid()) {
     std::fprintf(stderr, "TractViewport: shader load failed — aborting resource creation\n");
     return;  // linePs_ stays null; render() short-circuits, nothing crashes
   }
@@ -629,10 +702,12 @@ void TractViewport::CreateResources() {
   lineUboStride_ = alignUp(sizeof(LineUbo), ualign);
   pointUboStride_ = alignUp(sizeof(PointUbo), ualign);
   sliceUboStride_ = alignUp(sizeof(SliceUbo), ualign);
+  glyphUboStride_ = alignUp(sizeof(GlyphUbo), ualign);
   lineUbo_ = newUbo("lineUbo", 4 * lineUboStride_);
   pointUbo_ = newUbo("pointUbo", 4 * pointUboStride_);
   sliceUbo_ = newUbo("sliceUbo", kMaxBlendImages * 4 * sliceUboStride_);
-  if (!lineUbo_ || !pointUbo_ || !sliceUbo_) return;
+  glyphUbo_ = newUbo("glyphUbo", 4 * glyphUboStride_);  // one block per pane
+  if (!lineUbo_ || !pointUbo_ || !sliceUbo_ || !glyphUbo_) return;
 
   // The 3D-texture sampler (used by the slice pipeline; created up front so the
   // SRB can reference it even before a volume is loaded).
@@ -755,11 +830,39 @@ void TractViewport::CreateResources() {
   slicePs_->setTargetBlends({tb});
   if (!slicePs_->create()) { check(nullptr, "slicePs"); delete slicePs_; slicePs_ = nullptr; return; }
 
+  // ODF glyph pipeline (Triangles, opaque, depth test + write; two-sided lit in the
+  // fragment shader so cull-off interior lobe faces still shade). Vertex layout is
+  // interleaved [pos.xyz, normal.xyz, rgb] (9 floats), matching BuildGlyphs's mesh.
+  glyphSrb_ = rhi_->newShaderResourceBindings();
+  glyphSrb_->setBindings({SRB::uniformBufferWithDynamicOffset(
+      0, SRB::VertexStage | SRB::FragmentStage, glyphUbo_, sizeof(GlyphUbo))});
+  if (!glyphSrb_->create()) { check(nullptr, "glyphSrb"); return; }
+  glyphPs_ = rhi_->newGraphicsPipeline();
+  glyphPs_->setFlags(QRhiGraphicsPipeline::UsesScissor);
+  glyphPs_->setShaderStages({{QRhiShaderStage::Vertex, glyphVs}, {QRhiShaderStage::Fragment, glyphFs}});
+  QRhiVertexInputLayout glyphLayout;
+  glyphLayout.setBindings({QRhiVertexInputBinding(9 * sizeof(float))});
+  glyphLayout.setAttributes(
+      {QRhiVertexInputAttribute(0, 0, QRhiVertexInputAttribute::Float3, 0),
+       QRhiVertexInputAttribute(0, 1, QRhiVertexInputAttribute::Float3, 3 * sizeof(float)),
+       QRhiVertexInputAttribute(0, 2, QRhiVertexInputAttribute::Float3, 6 * sizeof(float))});
+  glyphPs_->setVertexInputLayout(glyphLayout);
+  glyphPs_->setShaderResourceBindings(glyphSrb_);
+  glyphPs_->setRenderPassDescriptor(rp);
+  glyphPs_->setSampleCount(samples);
+  glyphPs_->setTopology(QRhiGraphicsPipeline::Triangles);
+  glyphPs_->setCullMode(QRhiGraphicsPipeline::None);  // two-sided lobes (winding not trusted)
+  glyphPs_->setDepthTest(true);
+  glyphPs_->setDepthWrite(true);
+  if (!glyphPs_->create()) { check(nullptr, "glyphPs"); delete glyphPs_; glyphPs_ = nullptr; return; }
+
   // Force a re-upload of any geometry already staged before the device existed.
   lineDirty_ = !lineData_.empty();
   cageDirty_ = !cageData_.empty();
   boxDirty_ = hasBox_;
   highlightDirty_ = !highlightData_.empty();
+  glyphDirty_ = hasGlyphs_;
+  peaksDirty_ = hasPeaks_;
   for (TractOverlay& o : overlays_) o.dirty = !o.data.empty();
   for (ImageSlot& s : images_) { s.texDirty = s.lutDirty = s.quadsDirty = true; }
   focusDirty_ = !images_.empty();
@@ -783,6 +886,12 @@ void TractViewport::ReleaseAll() {
     o.vertexCount = 0;
   }
   for (QRhiResource** r : {
+           reinterpret_cast<QRhiResource**>(&glyphPs_),
+           reinterpret_cast<QRhiResource**>(&glyphSrb_),
+           reinterpret_cast<QRhiResource**>(&glyphUbo_),
+           reinterpret_cast<QRhiResource**>(&glyphIbo_),
+           reinterpret_cast<QRhiResource**>(&glyphVbo_),
+           reinterpret_cast<QRhiResource**>(&peaksVbo_),
            reinterpret_cast<QRhiResource**>(&slicePs_),
            reinterpret_cast<QRhiResource**>(&sliceSrb_),
            reinterpret_cast<QRhiResource**>(&sampler_),
@@ -808,12 +917,16 @@ void TractViewport::ReleaseAll() {
   // Bug fix: reset the upload/capacity state so a device-loss re-init re-uploads
   // everything instead of skipping it because the old flags said "done".
   lineVboCap_ = cageVboCap_ = boxVboCap_ = handleVboCap_ = highlightVboCap_ = 0;
+  glyphVboCap_ = glyphIboCap_ = peaksVboCap_ = 0;
   lineVertexCount_ = cageVertexCount_ = boxVertexCount_ = handleVertexCount_ =
       highlightVertexCount_ = 0;
+  glyphVertexCount_ = glyphIndexCount_ = peaksVertexCount_ = 0;
   lineDirty_ = !lineData_.empty();
   cageDirty_ = !cageData_.empty();
   boxDirty_ = hasBox_;
   highlightDirty_ = !highlightData_.empty();
+  glyphDirty_ = hasGlyphs_;
+  peaksDirty_ = hasPeaks_;
   for (TractOverlay& o : overlays_) o.dirty = !o.data.empty();
   for (ImageSlot& s : images_) { s.texDirty = s.lutDirty = s.quadsDirty = true; }
   focusDirty_ = !images_.empty();
@@ -869,6 +982,31 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
   boxDirty_ = false;
   syncVbo(highlightVbo_, highlightVboCap_, highlightVertexCount_, highlightData_, 6, highlightDirty_);
   for (TractOverlay& o : overlays_) syncVbo(o.vbo, o.cap, o.vertexCount, o.data, 6, o.dirty);
+  syncVbo(peaksVbo_, peaksVboCap_, peaksVertexCount_, peaksData_, 6, peaksDirty_);
+
+  // ODF glyph mesh: the [pos,normal,rgb] vertex buffer (9 floats/vertex) goes
+  // through syncVbo; its parallel uint32 index buffer is uploaded inline here with
+  // the same grow-on-demand pattern (syncVbo only handles float vertex buffers).
+  // A copied dirty flag drives the VBO so glyphDirty_ survives for the IBO below.
+  bool glyphVboDirty = glyphDirty_;
+  syncVbo(glyphVbo_, glyphVboCap_, glyphVertexCount_, glyphData_, 9, glyphVboDirty);
+  if (glyphDirty_) {
+    const std::size_t ibytes = glyphIndices_.size() * sizeof(std::uint32_t);
+    if (!glyphIbo_ || glyphIboCap_ < glyphIndices_.size()) {
+      if (glyphIbo_) { glyphIbo_->destroy(); delete glyphIbo_; glyphIbo_ = nullptr; }
+      glyphIboCap_ = std::max<std::size_t>(glyphIndices_.size(), 1);
+      glyphIbo_ = rhi_->newBuffer(QRhiBuffer::Static, QRhiBuffer::IndexBuffer,
+                                  static_cast<quint32>(glyphIboCap_ * sizeof(std::uint32_t)));
+      if (!glyphIbo_->create()) {
+        std::fprintf(stderr, "TractViewport: glyph index buffer create failed\n");
+        delete glyphIbo_; glyphIbo_ = nullptr; glyphIboCap_ = 0;
+      }
+    }
+    if (glyphIbo_ && ibytes > 0)
+      u->uploadStaticBuffer(glyphIbo_, 0, static_cast<quint32>(ibytes), glyphIndices_.data());
+    glyphIndexCount_ = glyphIbo_ ? glyphIndices_.size() : 0;
+    glyphDirty_ = false;
+  }
 
   // Background image layers: (re)create + upload each slot's 3D texture and LUT,
   // then (further down) its slice quads. The per-slot dirty flags gate every GPU
@@ -926,8 +1064,12 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
   // follows the volume (so you see the whole slice), but the focus (which slice
   // is shown) centres on the streamline bundle when one is loaded — that's where
   // the density map lives, so it's visible by default — else on the volume.
-  if (!focusInit_ && (lineVertexCount_ > 0 || !images_.empty())) {
-    const Bounds& frameB = hasVolumeBounds_ ? volumeBounds_ : bounds_;  // ortho view extent
+  if (!focusInit_ && (lineVertexCount_ > 0 || !images_.empty() || hasGlyphs_ || hasPeaks_)) {
+    const Bounds& frameB = hasVolumeBounds_      ? volumeBounds_
+                           : (lineVertexCount_ > 0) ? bounds_
+                           : hasGlyphs_          ? glyphBounds_
+                           : hasPeaks_           ? peaksBounds_
+                                                 : bounds_;             // ortho view extent
     const Bounds& focusB = (lineVertexCount_ > 0) ? bounds_ : frameB;   // slice at the bundle
     focus_ = {static_cast<float>(0.5 * (focusB.v[0] + focusB.v[1])),
               static_cast<float>(0.5 * (focusB.v[2] + focusB.v[3])),
@@ -993,6 +1135,14 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
     pu.params[0] = 13.0f;  // handle point size (px)
     u->updateDynamicBuffer(pointUbo_, i * pointUboStride_, sizeof(pu), &pu);
 
+    if (hasGlyphs_) {
+      GlyphUbo gu{};
+      std::memcpy(gu.mvp, mvp.constData(), sizeof(gu.mvp));
+      // Fixed world-space key light (matches the ODF prototype); shader normalizes it.
+      gu.lightDir[0] = 0.4f; gu.lightDir[1] = -0.7f; gu.lightDir[2] = 0.6f;
+      u->updateDynamicBuffer(glyphUbo_, i * glyphUboStride_, sizeof(gu), &gu);
+    }
+
     if (showVolume_) {
       for (int k = 0; k < static_cast<int>(vis.size()); ++k) {
         const ImageSlot& s = images_[vis[k]];
@@ -1044,7 +1194,21 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
     if (axis < 0) {
       if (showTracts_) drawLines(lineVbo_, lineVertexCount_);
       for (const TractOverlay& o : overlays_) drawLines(o.vbo, o.vertexCount);
+      if (showPeaks_) drawLines(peaksVbo_, peaksVertexCount_);  // DEC peak segments
       if (editMode_) drawLines(cageVbo_, cageVertexCount_);
+    }
+
+    // ODF glyphs (3-D pane only; opaque, depth test + write). Drawn after the
+    // streamlines and before the alpha-blended slices so depth resolves correctly.
+    if (axis < 0 && showGlyphs_ && glyphPs_ && glyphVbo_ && glyphIbo_ && glyphIndexCount_ > 0) {
+      cb->setGraphicsPipeline(glyphPs_);
+      cb->setViewport(vp);
+      cb->setScissor(sc);
+      const QRhiCommandBuffer::DynamicOffset glyphOff(0, static_cast<quint32>(i) * glyphUboStride_);
+      cb->setShaderResources(glyphSrb_, 1, &glyphOff);
+      const QRhiCommandBuffer::VertexInput vin(glyphVbo_, 0);
+      cb->setVertexInput(0, 1, &vin, glyphIbo_, 0, QRhiCommandBuffer::IndexUInt32);
+      cb->drawIndexed(static_cast<quint32>(glyphIndexCount_));
     }
 
     // Background image layers: blend each visible slot back-to-front (alpha
@@ -1141,6 +1305,7 @@ void TractViewport::mouseMoveEvent(QMouseEvent* event) {
     else if (sliceDragAxis_ == 1) focus_.y += wd;
     else focus_.z += wd;
     focusDirty_ = true;  // every layer's slice quads follow the shared focus
+    emit sliceFocusChanged();  // slice-following ODF/peaks rebuild at the new slice
     update();
   } else if (activeHandle_ >= 0) {                // 3D box edit (handles live in the 3D pane)
     DragSelectionHandle(QPointF(d.x(), d.y()));
@@ -1223,11 +1388,12 @@ void TractViewport::keyPressEvent(QKeyEvent* event) {
     else if (axis == 1) focus_.y += step;
     else focus_.z += step;
     focusDirty_ = true;  // every layer's slice quads follow the shared focus
+    emit sliceFocusChanged();  // slice-following ODF/peaks rebuild at the new slice
     update();
     return;
   }
   if (key == Qt::Key_R) {
-    ResetCamera();
+    ResetHoveredView();  // reset the pane under the cursor (all panes if none hovered)
   } else {
     QRhiWidget::keyPressEvent(event);
   }
