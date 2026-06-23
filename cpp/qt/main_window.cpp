@@ -632,6 +632,14 @@ MainWindow::MainWindow(Args args, QWidget* parent)
       break;
     }
   });
+  connect(properties_, &PropertiesPanel::colormapChanged, this, [this](bool viridis) {
+    for (VolumeLayer& vl : volumes_) {
+      if (vl.id != selectedVolumeId_) continue;
+      vl.viridis = viridis;  // remember per-volume (grayscale <-> viridis)
+      if (viewport_) viewport_->SetImageViridis(vl.id, viridis);
+      break;
+    }
+  });
 
   auto* scroll = new QScrollArea;
   scroll->setWidget(properties_);
@@ -1575,11 +1583,14 @@ void MainWindow::UpdateHistogram() {
     // For a stat layer the window handles are |stat| threshold/cap; show the diverging
     // legend (with units) beneath them. Hidden for grayscale volumes/labels.
     properties_->SetStatColorbar(vl.isStat, vl.winLo, vl.winHi, StatUnits(vl.statIntent));
+    // Colormap choice (grayscale/viridis) only for a plain scalar volume.
+    properties_->SetColormap(!vl.isLabel && !vl.isStat, vl.viridis);
     if (viewport_) viewport_->SetImageParams(vl.id, vl.winLo, vl.winHi, vl.opacity);
     return;
   }
   properties_->SetHistogram(false, {}, 0.0, 0.0, 0.0, 0.0);  // no selected layer
   properties_->SetStatColorbar(false, 0.0, 0.0, {});
+  properties_->SetColormap(false, false);
 }
 
 void MainWindow::RefreshStats() {

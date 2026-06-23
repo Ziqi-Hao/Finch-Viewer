@@ -336,6 +336,12 @@ void TractViewport::SetImageStatmap(int id, bool on) {
   }
 }
 
+void TractViewport::SetImageViridis(int id, bool on) {
+  // Just a colormap choice for a plain scalar volume (mode 0 <-> 4); it stays in
+  // the same draw tier and uses the same linear sampler, so only the UBO mode flips.
+  if (ImageSlot* s = FindImage(id)) { s->viridis = on; update(); }
+}
+
 void TractViewport::SetImageOrthoOnly(int id, bool on) {
   if (ImageSlot* s = FindImage(id)) { s->orthoOnly = on; update(); }
 }
@@ -1188,7 +1194,8 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
         // them in valueMin/valueRange exactly like a grayscale window, so no extra field.
         su.valueParams[0] = s.valueMin; su.valueParams[1] = s.valueRange;
         su.valueParams[2] = s.opacity;
-        su.valueParams[3] = s.statmap ? 3.0f                    // 0 gray, 1 label, 2 heatmap, 3 stat
+        su.valueParams[3] = s.statmap ? 3.0f                    // 0 gray,1 label,2 heatmap,3 stat,4 viridis
+                          : s.viridis ? 4.0f
                           : (s.heatmap ? 2.0f : (s.isLabel ? 1.0f : 0.0f));
         const quint32 off = (static_cast<quint32>(k) * 4 + static_cast<quint32>(i)) * sliceUboStride_;
         u->updateDynamicBuffer(sliceUbo_, off, sizeof(su), &su);

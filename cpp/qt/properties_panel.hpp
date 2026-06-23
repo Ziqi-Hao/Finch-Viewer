@@ -12,6 +12,7 @@
 #include <vector>
 
 class QAction;
+class QComboBox;
 class QDoubleSpinBox;
 class QGroupBox;
 class QLabel;
@@ -49,6 +50,9 @@ class PropertiesPanel : public QWidget {
   // Show/configure the diverging stat-overlay legend below the histogram (for an
   // fMRI z/t/r layer). hidden when `show` is false (grayscale volumes/labels).
   void SetStatColorbar(bool show, double threshold, double cap, const QString& units);
+  // Colormap selector (Grayscale / Viridis) for a plain scalar volume; hidden for
+  // labels and stat overlays (their colour is fixed).
+  void SetColormap(bool show, bool viridis);
   void SetEditMode(bool on);  // show/hide the Selection + Edit cards (view vs edit)
 
  signals:
@@ -56,6 +60,7 @@ class PropertiesPanel : public QWidget {
   void stepChanged(int dispStep);
   void boxChanged(const Bounds& box);  // user typed new box bounds
   void contrastRangeChanged(double lo, double hi);  // grayscale window dragged
+  void colormapChanged(bool viridis);               // colormap selector: false=grayscale, true=viridis
   void refreshStatsRequested();
 
  private:
@@ -69,6 +74,8 @@ class PropertiesPanel : public QWidget {
   QGroupBox* contrastCard_ = nullptr;   // hidden when no volume is active
   HistogramWidget* histogram_ = nullptr;
   StatColorbar* statColorbar_ = nullptr;   // diverging legend; shown only for stat layers
+  QComboBox* colormapCombo_ = nullptr;     // Grayscale / Viridis; shown only for plain volumes
+  QWidget* colormapRow_ = nullptr;         // the label+combo row (hidden together)
   QDoubleSpinBox* contrastLo_ = nullptr;   // editable window low (data units)
   QDoubleSpinBox* contrastHi_ = nullptr;   // editable window high (data units)
   QLabel* contrastRangeLabel_ = nullptr;   // "data range  min – max"

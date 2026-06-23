@@ -4,6 +4,7 @@
 #include "stat_colorbar.hpp"
 
 #include <QAction>
+#include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QFontDatabase>
 #include <QGridLayout>
@@ -127,6 +128,20 @@ PropertiesPanel::PropertiesPanel(const EditActions& actions, QWidget* parent)
     statColorbar_ = new StatColorbar;  // diverging legend; hidden unless a stat layer is active
     statColorbar_->setVisible(false);
     layout->addWidget(statColorbar_);
+
+    // Colormap selector — shown only for plain scalar volumes (labels/stat layers
+    // have a fixed colour). Grayscale is the default; Viridis is the perceptual map.
+    colormapRow_ = new QWidget;
+    auto* cmRow = new QHBoxLayout(colormapRow_);
+    cmRow->setContentsMargins(0, 0, 0, 0);
+    cmRow->addWidget(new QLabel("Colormap"));
+    colormapCombo_ = new QComboBox;
+    colormapCombo_->addItems({"Grayscale", "Viridis"});
+    cmRow->addWidget(colormapCombo_, 1);
+    colormapRow_->setVisible(false);
+    layout->addWidget(colormapRow_);
+    connect(colormapCombo_, &QComboBox::currentIndexChanged, this,
+            [this](int idx) { emit colormapChanged(idx == 1); });
 
     // Drag the histogram -> reflect into the fields (no echo) + bubble the change up.
     connect(histogram_, &HistogramWidget::rangeChanged, this, [this](double lo, double hi) {
@@ -290,6 +305,12 @@ void PropertiesPanel::SetStatColorbar(bool show, double threshold, double cap,
                                       const QString& units) {
   statColorbar_->setVisible(show);
   if (show) statColorbar_->SetStat(threshold, cap, units);
+}
+
+void PropertiesPanel::SetColormap(bool show, bool viridis) {
+  colormapRow_->setVisible(show);
+  QSignalBlocker block(colormapCombo_);  // reflect the layer's choice without re-emitting
+  colormapCombo_->setCurrentIndex(viridis ? 1 : 0);
 }
 
 void PropertiesPanel::SetEditMode(bool on) {

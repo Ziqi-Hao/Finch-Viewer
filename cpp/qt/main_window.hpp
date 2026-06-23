@@ -91,6 +91,7 @@ class MainWindow : public QMainWindow {
     int lutWidth = 0;                   // label mode: number of label entries
     bool isStat = false;                // signed fMRI stat overlay (diverging + threshold)
     int statIntent = 0;                 // NIfTI intent_code (drives the colorbar units label)
+    bool viridis = false;               // plain volume colormap choice: false=grayscale, true=viridis
   };
 
   void RebuildDisplay();   // active full-set alive mask -> sampled GPU line buffer
