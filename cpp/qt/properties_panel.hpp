@@ -21,6 +21,7 @@ class QSpinBox;
 namespace tracto {
 
 class HistogramWidget;
+class StatColorbar;
 
 // The edit commands, shared with the menu/toolbar so the panel buttons are the
 // same single-source-of-truth QActions (enabled state etc. stays in sync).
@@ -45,6 +46,9 @@ class PropertiesPanel : public QWidget {
   // false hides the Contrast card.
   void SetHistogram(bool hasVolume, std::vector<float> bins, double dataMin, double dataMax,
                     double lo, double hi);
+  // Show/configure the diverging stat-overlay legend below the histogram (for an
+  // fMRI z/t/r layer). hidden when `show` is false (grayscale volumes/labels).
+  void SetStatColorbar(bool show, double threshold, double cap, const QString& units);
   void SetEditMode(bool on);  // show/hide the Selection + Edit cards (view vs edit)
 
  signals:
@@ -64,6 +68,7 @@ class PropertiesPanel : public QWidget {
   QLabel* infoLabel_ = nullptr;         // top: basic volume/tractogram info
   QGroupBox* contrastCard_ = nullptr;   // hidden when no volume is active
   HistogramWidget* histogram_ = nullptr;
+  StatColorbar* statColorbar_ = nullptr;   // diverging legend; shown only for stat layers
   QDoubleSpinBox* contrastLo_ = nullptr;   // editable window low (data units)
   QDoubleSpinBox* contrastHi_ = nullptr;   // editable window high (data units)
   QLabel* contrastRangeLabel_ = nullptr;   // "data range  min – max"

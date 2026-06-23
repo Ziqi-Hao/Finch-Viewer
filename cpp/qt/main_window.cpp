@@ -64,13 +64,27 @@ bool IsStatIntent(int code) {
     case 4:   // NIFTI_INTENT_FTEST
     case 5:   // NIFTI_INTENT_ZSCORE
     case 6:   // NIFTI_INTENT_CHISQ
-    case 9:   // NIFTI_INTENT_BETA
+    case 7:   // NIFTI_INTENT_BETA (signed regression coefficients)
     case 22:  // NIFTI_INTENT_PVAL
     case 23:  // NIFTI_INTENT_LOGPVAL
     case 24:  // NIFTI_INTENT_LOG10PVAL
       return true;
     default:
       return false;
+  }
+}
+
+// Short statistic-unit label for the stat colorbar, from the NIfTI intent_code.
+QString StatUnits(int intentCode) {
+  switch (intentCode) {
+    case 2:  return QStringLiteral("r");     // CORREL
+    case 3:  return QStringLiteral("t");     // TTEST
+    case 4:  return QStringLiteral("F");     // FTEST
+    case 5:  return QStringLiteral("z");     // ZSCORE
+    case 6:  return QStringLiteral("χ²");    // CHISQ
+    case 7:  return QStringLiteral("β");     // BETA
+    case 22: case 23: case 24: return QStringLiteral("p");  // PVAL / LOGPVAL / LOG10PVAL
+    default: return QStringLiteral("stat");  // signed map with no/unknown intent
   }
 }
 
@@ -613,6 +627,8 @@ MainWindow::MainWindow(Args args, QWidget* parent)
       vl.winLo = static_cast<float>(lo);  // remember per-volume
       vl.winHi = static_cast<float>(hi);
       if (viewport_) viewport_->SetImageParams(vl.id, vl.winLo, vl.winHi, vl.opacity);
+      if (vl.isStat)  // keep the diverging legend in step with the dragged threshold/cap
+        properties_->SetStatColorbar(true, lo, hi, StatUnits(vl.statIntent));
       break;
     }
   });
@@ -807,6 +823,7 @@ void MainWindow::LoadVolumeLayer(const QString& path, bool isLabel) {
     const int id = layers_->AddLayer(kind, name, true);
     VolumeLayer layer{std::move(volume), name, id, isLabel, vmin, vmax};
     layer.isStat = isStat;
+    layer.statIntent = isStat ? peek.intentCode : 0;
     if (isStat)
       ComputeStatHistogram(layer, peek.intentCode);  // |stat| bins + symmetric threshold/cap
     else
@@ -1555,10 +1572,14 @@ void MainWindow::UpdateHistogram() {
   for (const VolumeLayer& vl : volumes_) {
     if (vl.id != selectedVolumeId_) continue;
     properties_->SetHistogram(true, vl.histBins, vl.dispMin, vl.dispMax, vl.winLo, vl.winHi);
+    // For a stat layer the window handles are |stat| threshold/cap; show the diverging
+    // legend (with units) beneath them. Hidden for grayscale volumes/labels.
+    properties_->SetStatColorbar(vl.isStat, vl.winLo, vl.winHi, StatUnits(vl.statIntent));
     if (viewport_) viewport_->SetImageParams(vl.id, vl.winLo, vl.winHi, vl.opacity);
     return;
   }
   properties_->SetHistogram(false, {}, 0.0, 0.0, 0.0, 0.0);  // no selected layer
+  properties_->SetStatColorbar(false, 0.0, 0.0, {});
 }
 
 void MainWindow::RefreshStats() {

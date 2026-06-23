@@ -1,6 +1,7 @@
 #include "properties_panel.hpp"
 
 #include "histogram_widget.hpp"
+#include "stat_colorbar.hpp"
 
 #include <QAction>
 #include <QDoubleSpinBox>
@@ -122,6 +123,10 @@ PropertiesPanel::PropertiesPanel(const EditActions& actions, QWidget* parent)
     contrastRangeLabel_ = new QLabel;
     contrastRangeLabel_->setObjectName("hintLabel");  // muted style if the theme has it
     layout->addWidget(contrastRangeLabel_);
+
+    statColorbar_ = new StatColorbar;  // diverging legend; hidden unless a stat layer is active
+    statColorbar_->setVisible(false);
+    layout->addWidget(statColorbar_);
 
     // Drag the histogram -> reflect into the fields (no echo) + bubble the change up.
     connect(histogram_, &HistogramWidget::rangeChanged, this, [this](double lo, double hi) {
@@ -279,6 +284,12 @@ void PropertiesPanel::SetHistogram(bool hasVolume, std::vector<float> bins, doub
   contrastRangeLabel_->setText(QString("data range  %1 – %2")
                                   .arg(QString::number(dataMin, 'f', dec),
                                        QString::number(dataMax, 'f', dec)));
+}
+
+void PropertiesPanel::SetStatColorbar(bool show, double threshold, double cap,
+                                      const QString& units) {
+  statColorbar_->setVisible(show);
+  if (show) statColorbar_->SetStat(threshold, cap, units);
 }
 
 void PropertiesPanel::SetEditMode(bool on) {

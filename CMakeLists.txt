@@ -141,6 +141,7 @@ if(Qt6_FOUND)
     cpp/qt/properties_panel.cpp
     cpp/qt/layers_panel.cpp
     cpp/qt/histogram_widget.cpp
+    cpp/qt/stat_colorbar.cpp
   )
   set_target_properties(local_editor_qt PROPERTIES AUTOMOC ON)
 

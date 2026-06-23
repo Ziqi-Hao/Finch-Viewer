@@ -90,6 +90,7 @@ class MainWindow : public QMainWindow {
     std::vector<float> lut;             // label mode: RGBA per label index
     int lutWidth = 0;                   // label mode: number of label entries
     bool isStat = false;                // signed fMRI stat overlay (diverging + threshold)
+    int statIntent = 0;                 // NIfTI intent_code (drives the colorbar units label)
   };
 
   void RebuildDisplay();   // active full-set alive mask -> sampled GPU line buffer
