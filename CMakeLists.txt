@@ -127,20 +127,9 @@ if(Qt6_FOUND)
     list(APPEND QT_RHI_QSB_FILES ${out})
   endforeach()
 
-  # Generate a .qrc that embeds the .qsb files under the :/shaders/ prefix. The
-  # .qsb live in the binary dir, so the .qrc uses their absolute paths.
-  set(QT_RHI_QRC ${QT_RHI_QSB_DIR}/qt_shaders.qrc)
-  set(QRC_BODY "<RCC>\n  <qresource prefix=\"/shaders\">\n")
-  foreach(shader ${QT_RHI_SHADERS})
-    string(APPEND QRC_BODY
-      "    <file alias=\"${shader}.qsb\">${QT_RHI_QSB_DIR}/${shader}.qsb</file>\n")
-  endforeach()
-  string(APPEND QRC_BODY "  </qresource>\n</RCC>\n")
-  file(GENERATE OUTPUT ${QT_RHI_QRC} CONTENT "${QRC_BODY}")
-
-  # Drive the qsb custom commands from a target the executable depends on, so the
-  # .qsb are produced before AUTORCC reads the .qrc.
-  add_custom_target(qt_rhi_shaders DEPENDS ${QT_RHI_QSB_FILES})
+  # The .qsb are build-time outputs (the custom commands above); mark them so the
+  # resource step knows they are generated, not missing.
+  set_source_files_properties(${QT_RHI_QSB_FILES} PROPERTIES GENERATED TRUE)
 
   add_executable(local_editor_qt
     cpp/qt/main.cpp
@@ -152,11 +141,21 @@ if(Qt6_FOUND)
     cpp/qt/properties_panel.cpp
     cpp/qt/layers_panel.cpp
     cpp/qt/histogram_widget.cpp
-    ${QT_RHI_QRC}
   )
-  add_dependencies(local_editor_qt qt_rhi_shaders)
-  set_source_files_properties(${QT_RHI_QRC} PROPERTIES GENERATED TRUE)
-  set_target_properties(local_editor_qt PROPERTIES AUTOMOC ON AUTORCC ON)
+  set_target_properties(local_editor_qt PROPERTIES AUTOMOC ON)
+
+  # Embed the compiled .qsb as Qt resources, loaded at runtime as
+  # ":/shaders/<name>.qsb" (BASE strips the binary dir, PREFIX adds /shaders).
+  # Use qt6_add_resources rather than a hand-written .qrc + AUTORCC: this makes rcc
+  # depend on the .qsb CONTENT, so it re-embeds whenever a shader recompiles and
+  # only after the qsb custom commands run. A hand-rolled .qrc + AUTORCC silently
+  # kept a STALE shader — AUTORCC re-runs on .qrc *text* changes (never, here, since
+  # the file list is fixed), not on the referenced files, and ran before the qsb
+  # rebuilt — so every edit to a .vert/.frag was a no-op until a clean rebuild.
+  qt6_add_resources(local_editor_qt "rhi_shaders"
+    PREFIX "/shaders"
+    BASE ${QT_RHI_QSB_DIR}
+    FILES ${QT_RHI_QSB_FILES})
   target_link_libraries(local_editor_qt PRIVATE
     tracto_core
     tracto_odf
