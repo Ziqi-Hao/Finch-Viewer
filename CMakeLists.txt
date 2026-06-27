@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.18)
 
 project(tractography_local_editor_cpp LANGUAGES CXX C)
+
+# Refuse in-source builds: running cmake in the repo root scatters CMakeCache.txt,
+# CMakeFiles/, Makefile, etc. across the tree. Always build into ./build.
+if(CMAKE_BINARY_DIR STREQUAL CMAKE_SOURCE_DIR)
+  message(FATAL_ERROR "In-source builds are not allowed. Use: cmake -S . -B build")
+endif()
+
 include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -9,11 +16,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Source layout:
 #   cpp/core   shared, UI-free modules (io / data / compute)  -> tracto_core
-#   cpp/qt     Qt + OpenGL editor                              -> local_editor_qt
-#   cpp/glfw   GLFW + OpenGL viewer                            -> local_editor_glfw
-#   cpp/vtk    legacy VTK editor (opt-in)                      -> local_editor_cpp
-# Apps link tracto_core; the static-lib linker pulls in only the objects each
-# app actually references.
+#   cpp/odf    pure-CPU ODF load + glyph mesh build            -> tracto_odf
+#   cpp/qt     Qt + RHI (Metal) editor — the only app          -> local_editor_qt
+# The app links tracto_core + tracto_odf; the static-lib linker pulls in only
+# the objects it actually references.
 
 find_package(ZLIB REQUIRED)   # NIfTI .nii.gz decompression (cpp/core/nifti_io)
 find_package(OpenMP)
@@ -64,33 +70,13 @@ add_library(tracto_odf STATIC
 target_include_directories(tracto_odf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/odf)
 target_link_libraries(tracto_odf PUBLIC ZLIB::ZLIB)
 
-# ── vendored GL loader + GLFW (for the GLFW viewer / probe) ──────────────────
-set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-add_subdirectory(dmri-explorer/deps/glfw-3.3.6 EXCLUDE_FROM_ALL)
-
-add_library(tracto_glad STATIC
-  dmri-explorer/deps/glad/src/glad.c
-)
-target_include_directories(tracto_glad PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/dmri-explorer/deps/glad/include
-)
-
-# ── GLFW/OpenGL viewer + context probe ──────────────────────────────────────
-add_executable(glfw_probe tools/glfw_probe.cpp)
-target_link_libraries(glfw_probe PRIVATE glfw tracto_glad)
-
-add_executable(local_editor_glfw
-  cpp/glfw/main.cpp
-  cpp/glfw/glfw_tract_viewer.cpp
-)
-target_link_libraries(local_editor_glfw PRIVATE tracto_core glfw tracto_glad)
-if(WIN32)
-  target_link_libraries(local_editor_glfw PRIVATE gdi32)
+if(BUILD_TESTING)
+  add_executable(odf_selftest cpp/odf/odf_selftest.cpp)
+  target_link_libraries(odf_selftest PRIVATE tracto_odf)
+  add_test(NAME odf_selftest COMMAND odf_selftest)
 endif()
 
-# ── Qt RHI editor (the primary editor; no VTK, no glfw/glad) ─────────────────
+# ── Qt RHI editor (the only C++ editor; pure Qt + RHI, no VTK/GL) ────────────
 # The viewport is a QRhiWidget (Metal on macOS), so we need Qt6::GuiPrivate for
 # <rhi/qrhi.h>; OpenGL/OpenGLWidgets are no longer used. Optional: builds only
 # when Qt6 is found, so the project still configures without Qt installed.
@@ -120,7 +106,7 @@ if(Qt6_FOUND)
     set(out ${QT_RHI_QSB_DIR}/${shader}.qsb)
     add_custom_command(
       OUTPUT ${out}
-      COMMAND ${QSB_EXECUTABLE} --glsl 430 --msl 12 -o ${out} ${src}
+      COMMAND ${QSB_EXECUTABLE} --glsl 430 --msl 12 --hlsl 50 -o ${out} ${src}
       DEPENDS ${src}
       COMMENT "qsb ${shader} -> ${shader}.qsb"
       VERBATIM)
@@ -144,7 +130,19 @@ if(Qt6_FOUND)
     cpp/qt/stat_colorbar.cpp
     cpp/qt/orientation_overlay.cpp
   )
-  set_target_properties(local_editor_qt PROPERTIES AUTOMOC ON)
+  # Build as a user-facing, deployable app per platform: a Finch-Viewer.app bundle
+  # on macOS (so macdeployqt can bundle Qt into it), a GUI exe (no console) on
+  # Windows. The CMake TARGET name stays local_editor_qt (build scripts unchanged);
+  # only the produced artifact is renamed.
+  set_target_properties(local_editor_qt PROPERTIES
+    AUTOMOC ON
+    OUTPUT_NAME "Finch-Viewer"
+    MACOSX_BUNDLE ON
+    WIN32_EXECUTABLE ON
+    MACOSX_BUNDLE_BUNDLE_NAME "Finch-Viewer"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.ziqihao.finch-viewer"
+    MACOSX_BUNDLE_BUNDLE_VERSION "0.1.0"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1.0")
 
   # Embed the compiled .qsb as Qt resources, loaded at runtime as
   # ":/shaders/<name>.qsb" (BASE strips the binary dir, PREFIX adds /shaders).
@@ -167,26 +165,4 @@ if(Qt6_FOUND)
   )
 else()
   message(STATUS "Qt6 not found: skipping local_editor_qt target")
-endif()
-
-# ── Legacy VTK editor (opt-in) ──────────────────────────────────────────────
-# Off by default: Homebrew's VTK 9.6 dropped the bundled <vtk_glew.h> that
-# cpp/vtk/editor_app.cpp uses, so it does not build out-of-the-box on macOS.
-# Enable on Windows/vcpkg (or after porting the raw-GL include) with
-# -DBUILD_VTK_EDITOR=ON.
-option(BUILD_VTK_EDITOR "Build the legacy VTK editor (local_editor_cpp)" OFF)
-if(BUILD_VTK_EDITOR)
-  find_package(VTK REQUIRED COMPONENTS
-    CommonColor CommonCore CommonDataModel CommonExecutionModel
-    FiltersCore ImagingColor ImagingCore InteractionStyle InteractionWidgets
-    IOImage RenderingCore RenderingFreeType RenderingOpenGL2 RenderingUI
-  )
-  add_executable(local_editor_cpp
-    cpp/vtk/main.cpp
-    cpp/vtk/editor_app.cpp
-  )
-  target_link_libraries(local_editor_cpp PRIVATE tracto_core ${VTK_LIBRARIES})
-  if(COMMAND vtk_module_autoinit)
-    vtk_module_autoinit(TARGETS local_editor_cpp MODULES ${VTK_LIBRARIES})
-  endif()
 endif()

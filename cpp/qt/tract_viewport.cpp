@@ -81,7 +81,17 @@ void BuildBoxEdges(std::vector<float>& out, const Bounds& box, std::array<float,
 }  // namespace
 
 TractViewport::TractViewport(QWidget* parent) : QRhiWidget(parent) {
-  setApi(QRhiWidget::Api::Metal);  // RHI sets the backend on the widget (no QSurfaceFormat)
+  // Pick the RHI backend per platform (the widget owns it — no QSurfaceFormat).
+  // macOS system GL is frozen at 4.1 so Metal is the only modern path there; on
+  // Windows D3D11 is the universal default; elsewhere (Linux) OpenGL is the most
+  // broadly available (the shipped editor needs no compute, so GL is fine).
+#if defined(Q_OS_MACOS)
+  setApi(QRhiWidget::Api::Metal);
+#elif defined(Q_OS_WIN)
+  setApi(QRhiWidget::Api::Direct3D11);
+#else
+  setApi(QRhiWidget::Api::OpenGL);
+#endif
   setSampleCount(4);               // 4x MSAA to match the old GL viewport's look
   setFocusPolicy(Qt::StrongFocus); // needed for keyPressEvent (reset camera)
   setMouseTracking(true);          // hover updates hoverPane_ for arrow-key slice scrub
