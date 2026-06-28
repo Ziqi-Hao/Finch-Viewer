@@ -3,10 +3,6 @@
 **Diffusion & functional MRI in one GPU scene — tractography, ODFs, peaks, and activation maps. Just Open the file.**
 
 <p align="center">
-  <img src="docs/images/odf-glyphs.png" alt="Direction-colored, lit fODF glyphs rendered on the GPU" width="480">
-</p>
-
-<p align="center">
   <a href="docs/images/ui.png"><img src="docs/images/ui.png" alt="The full app" height="150"></a>
   &emsp;
   <a href="docs/images/fmri.png"><img src="docs/images/fmri.png" alt="Signed fMRI activation overlay with diverging colorbar + orientation labels" height="150"></a>
