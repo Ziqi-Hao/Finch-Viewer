@@ -6,11 +6,21 @@
 
 # ── C++ build output ─────────────────────────────────────────────────────────
 build/
-vcpkg_installed/
 *.obj
 *.exe
 *.pdb
 *.ilk
+
+# Stray in-source CMake artifacts (builds must go in build/; CMakeLists.txt also
+# hard-errors on in-source configure). Anchored to root so nested ones still show.
+/CMakeCache.txt
+/CMakeFiles/
+/Makefile
+/cmake_install.cmake
+/CTestTestfile.cmake
+/DartConfiguration.tcl
+/Testing/
+/.qt/
 
 # ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
@@ -28,6 +38,10 @@ agent-skills/
 debug_*
 ui_*.png
 *.ppm
+
+# ── Draft manuscript (placeholder-laden .md + regenerable .docx) ─────────────
+# Not tracked while in draft; revisit and track manuscript/*.md once finalized.
+manuscript/
 
 # ── OS / editor cruft ────────────────────────────────────────────────────────
 .DS_Store

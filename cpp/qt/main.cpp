@@ -129,6 +129,7 @@ int main(int argc, char** argv) {
         std::cout << (ok ? "screenshot -> " : "screenshot FAILED -> ") << shot.toStdString() << "\n";
       }
       if (!winShot.isEmpty()) {
+        window.DebugRefreshStats();  // populate the Properties stats before the grab
         const bool ok = window.SaveWindowShot(winShot);
         std::cout << (ok ? "window-shot -> " : "window-shot FAILED -> ") << winShot.toStdString() << "\n";
       }

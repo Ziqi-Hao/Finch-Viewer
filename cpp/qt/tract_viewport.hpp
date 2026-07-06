@@ -12,7 +12,7 @@
 #include "bounds.hpp"
 #include "display_geometry.hpp"  // DisplaySpan (per-streamline vertex ranges)
 #include "nifti_io.hpp"
-#include "render_math.hpp"
+#include "camera_math.hpp"
 
 #include <QElapsedTimer>
 #include <QRhiWidget>
@@ -124,6 +124,11 @@ class TractViewport : public QRhiWidget {
   // Jump the slice focus to a world Z and lock it (used for headless verification of
   // slice-following; equivalent to scrubbing the axial pane there).
   void SetSliceFocusZ(float z);
+
+  // Borrow the retained voxel grid of an image layer (the viewport owns it after
+  // SetImage moved it in), so MainWindow can sample it for the "Volume on tract"
+  // statistic without keeping a second CPU copy. nullptr if no such layer.
+  const Volume* ImageVolume(int id) const;
 
  signals:
   void sliceFocusChanged();  // the slice crosshair moved (arrow scrub / slice-plane drag)

@@ -44,6 +44,12 @@ static_assert(sizeof(PointUbo) == 80, "PointUbo std140 size");
 static_assert(sizeof(SliceUbo) == 160, "SliceUbo std140 size");
 static_assert(sizeof(GlyphUbo) == 80, "GlyphUbo std140 size");
 
+// Initial selection box side, as a fraction of the data extent per axis. Kept in
+// sync with the Python reference's default_box_bounds() (editor.py: 0.30) so the
+// default delete/keep region matches across editors. It is only a starting
+// position — the user drags it — so this is parity, not a behavioural constraint.
+constexpr double kDefaultBoxFrac = 0.30;
+
 QShader LoadShader(const QString& path) {
   QFile f(path);
   if (!f.open(QIODevice::ReadOnly)) {
@@ -117,7 +123,7 @@ void TractViewport::SetLineGeometry(std::vector<float> interleaved, std::vector<
   bounds_ = bounds;
   lineDirty_ = true;
   RebuildCage();
-  if (!hasBox_) PlaceSelectionBoxInBounds(0.6);
+  if (!hasBox_) PlaceSelectionBoxInBounds(kDefaultBoxFrac);
   UpdateHighlight();  // geometry/spans changed -> recompute the in-box overlay
   update();           // schedule a repaint; the upload happens in render()
 }
@@ -246,6 +252,12 @@ QString TractViewport::RendererName() const {
 
 TractViewport::ImageSlot* TractViewport::FindImage(int id) {
   for (ImageSlot& s : images_) if (s.id == id) return &s;
+  return nullptr;
+}
+
+const Volume* TractViewport::ImageVolume(int id) const {
+  for (const ImageSlot& s : images_)
+    if (s.id == id) return s.vol.Empty() ? nullptr : &s.vol;
   return nullptr;
 }
 
@@ -402,7 +414,7 @@ void TractViewport::SetEditMode(bool on) {
 }
 
 void TractViewport::ResetSelectionBox() {
-  PlaceSelectionBoxInBounds(0.6);
+  PlaceSelectionBoxInBounds(kDefaultBoxFrac);
   UpdateHighlight();
   update();
 }
@@ -1070,7 +1082,7 @@ void TractViewport::render(QRhiCommandBuffer* cb) {
         delete s.tex; s.tex = nullptr;
       } else {
         // 3D upload: one entry per z-slice; setDataStride gives the row pitch (x
-        // fastest). Mirrors tract_viewer_rhi.cpp's per-slice upload pattern.
+        // fastest). One upload entry per depth slice of the R32F volume texture.
         std::vector<QRhiTextureUploadEntry> entries;
         entries.reserve(nz);
         for (int z = 0; z < nz; ++z) {

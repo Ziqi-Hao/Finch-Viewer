@@ -6,7 +6,8 @@
 // Qt renderer can place orthogonal slices in the same RAS mm space as the
 // streamlines. io module: no VTK, no Qt — only zlib for .nii.gz.
 
-#include "render_math.hpp"  // Mat4 (row-major affine)
+#include "bounds.hpp"    // Bounds (WorldBounds)
+#include "mat_math.hpp"  // Mat4 (row-major affine)
 
 #include <cstddef>
 #include <string>

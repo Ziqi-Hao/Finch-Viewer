@@ -6,9 +6,8 @@
       "name": "base",
       "hidden": true,
       "binaryDir": "${sourceDir}/build/${presetName}",
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
-        "VCPKG_OVERLAY_PORTS": "${sourceDir}/vcpkg-overlays"
+        "CMAKE_BUILD_TYPE": "Release"
       }
     },
     {
@@ -22,15 +21,13 @@
       "name": "linux",
       "displayName": "Linux (Ninja, Release)",
       "inherits": "base",
-      "generator": "Ninja",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "generator": "Ninja"
     },
     {
       "name": "macos",
       "displayName": "macOS (Ninja, Release)",
       "inherits": "base",
-      "generator": "Ninja",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "generator": "Ninja"
     }
   ],
   "buildPresets": [

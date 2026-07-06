@@ -13,7 +13,7 @@ constexpr double kPad = 5.0;  // inset of each letter from its pane edge
 
 // The four edge letters for an ortho pane, fixed by the OrthoSliceCamera basis
 // (RAS: +X=R −X=L, +Y=A −Y=P, +Z=S −Z=I): axial right=+X up=+Y; coronal right=−X
-// up=+Z; sagittal right=+Y up=+Z. Kept in lockstep with render_math.hpp's Right()/Up().
+// up=+Z; sagittal right=+Y up=+Z. Kept in lockstep with camera_math.hpp's Right()/Up().
 struct Edges { const char* top; const char* bottom; const char* left; const char* right; };
 Edges EdgesFor(int axis) {
   switch (axis) {

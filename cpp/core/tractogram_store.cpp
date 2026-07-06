@@ -10,7 +10,6 @@ namespace tracto {
 void BuildSoA(TractogramStore& store) {
   const std::size_t n = store.streamlines.size();
   store.offsets.assign(n + 1, 0);
-  store.pointCounts.assign(n, 0);
   store.lengthsMm.assign(n, 0.0);
 
   std::size_t totalPoints = 0;
@@ -19,7 +18,6 @@ void BuildSoA(TractogramStore& store) {
     if (sl.pointCount < 0) {
       throw std::runtime_error("negative streamline point count");
     }
-    store.pointCounts[i] = sl.pointCount;
     totalPoints += static_cast<std::size_t>(sl.pointCount);
     store.offsets[i + 1] = static_cast<int64_t>(totalPoints);
   }

@@ -21,6 +21,7 @@
 // odf_volume.cpp, glyph_builder.cpp); this file adds no new dependency.
 
 #include "glyph_builder.hpp"
+#include "glyph_scene.hpp"
 #include "icosphere.hpp"
 #include "odf_types.hpp"
 #include "odf_volume.hpp"
@@ -316,8 +317,9 @@ void TestGlyphBuilder() {
 void TestOdfVolume() {
   std::cout << "[d] odf_volume\n";
 
-  const std::string demoPath =
-      "/Users/haoziqi/Documents/Finch-Viewer/dmri-explorer/data/odf.nii.gz";
+  // Optional fixture: drop an fODF at data/odf.nii.gz (gitignored) to exercise the
+  // loader. Absent -> this case skips (run from the repo root for the relative path).
+  const std::string demoPath = "data/odf.nii.gz";
 
   // Probe for the demo file without throwing: try to load, treat "file not
   // found" style failures as a skip rather than a test failure. We can't stat
@@ -415,6 +417,86 @@ void TestOdfVolume() {
   }
 }
 
+// --- (e) glyph/peaks SCENE builders + Open-router classifiers ---------------
+// These moved out of the Qt shell into tracto_odf precisely so they could be
+// exercised here without Qt. Small synthetic volumes make the budget/mask/pack
+// and classification logic assertable.
+void TestGlyphScene() {
+  std::cout << "[e] glyph_scene\n";
+
+  const int nCoeffs = 45;  // L8 symmetric
+  const int nx = 2, ny = 2, nz = 2;
+  const std::size_t spatial = static_cast<std::size_t>(nx) * ny * nz;
+
+  // Isotropic fODF: positive DC (coeff 0) in every voxel, zero elsewhere. Below
+  // the glyph budget, so every voxel is drawn (no slicing) with lMax = 8.
+  OdfVolume fodf;
+  fodf.dims[0] = nx; fodf.dims[1] = ny; fodf.dims[2] = nz;
+  fodf.nCoeffs = nCoeffs;
+  fodf.coeffs.assign(spatial * static_cast<std::size_t>(nCoeffs), 0.0f);
+  for (std::size_t v = 0; v < spatial; ++v) fodf.coeffs[v] = 1.0f;  // coeff-0 plane
+  fodf.affine = Affine{};
+  fodf.valueMin = 0.0f;
+  fodf.valueMax = 1.0f;
+
+  const OdfGlyphScene scene = BuildOdfGlyphScene(fodf);
+  Check(scene.glyphCount == spatial,
+        "BuildOdfGlyphScene draws all voxels below budget (" +
+            std::to_string(scene.glyphCount) + " == " + std::to_string(spatial) + ")");
+  Check(!scene.sliced, "small fODF -> whole-volume scene (not sliced)");
+  Check(scene.lMax == 8, "scene lMax == 8 for nCoeffs 45");
+  Check(!scene.vertices.empty() && !scene.indices.empty(),
+        "scene has vertices + indices");
+  Check(scene.vertices.size() % 9 == 0, "glyph vertices are 9 floats each");
+  Check(scene.bounds.min.x <= scene.bounds.max.x &&
+            scene.bounds.min.y <= scene.bounds.max.y &&
+            scene.bounds.min.z <= scene.bounds.max.z,
+        "scene bounds min <= max on every axis");
+
+  // LooksLikeFodf: overwhelmingly-positive DC -> true; a stacked vector field
+  // (coeff-0 signed, positive ~half the time) -> false.
+  Check(LooksLikeFodf(fodf), "positive-DC volume LooksLikeFodf");
+  OdfVolume signed_ = fodf;
+  for (std::size_t v = 0; v < spatial; ++v) signed_.coeffs[v] = (v % 2 == 0) ? 1.0f : -1.0f;
+  signed_.valueMin = -1.0f;
+  Check(!LooksLikeFodf(signed_), "signed-DC volume does NOT LooksLikeFodf");
+
+  // IsEvenSymmetricShCount: the canonical fODF counts pass; a 3-vector peaks
+  // count (nCoeffs = 3) is rejected so the router never glyphs a peaks file.
+  Check(IsEvenSymmetricShCount(6) && IsEvenSymmetricShCount(45),
+        "IsEvenSymmetricShCount accepts 6 and 45");
+  Check(!IsEvenSymmetricShCount(3) && !IsEvenSymmetricShCount(1),
+        "IsEvenSymmetricShCount rejects 3 (peaks) and 1 (scalar)");
+
+  // Peaks scene: one peak per voxel (nCoeffs = 3), unit +X direction -> one
+  // bidirectional segment per voxel, all present (below the segment budget).
+  OdfVolume peaks;
+  peaks.dims[0] = nx; peaks.dims[1] = ny; peaks.dims[2] = nz;
+  peaks.nCoeffs = 3;
+  peaks.coeffs.assign(spatial * 3, 0.0f);
+  for (std::size_t v = 0; v < spatial; ++v) peaks.coeffs[v] = 1.0f;  // x-component plane
+  peaks.affine = Affine{};
+  peaks.valueMin = 0.0f;
+  peaks.valueMax = 1.0f;
+
+  const PeaksScene ps = BuildPeaksScene(peaks);
+  Check(ps.nPeaks == 1, "peaks scene reports 1 dir/voxel");
+  Check(ps.segmentCount == spatial,
+        "one segment per voxel below budget (" + std::to_string(ps.segmentCount) +
+            " == " + std::to_string(spatial) + ")");
+  Check(ps.vertices.size() == ps.segmentCount * 12, "peaks verts = 12 floats/segment");
+
+  // AxialSliceIndex: identity affine -> world-z equals k; clamps out-of-range.
+  OdfVolume col;
+  col.dims[0] = 1; col.dims[1] = 1; col.dims[2] = 4;
+  col.nCoeffs = 1;
+  col.coeffs.assign(4, 0.0f);
+  col.affine = Affine{};
+  Check(AxialSliceIndex(col, 2.0f) == 2, "AxialSliceIndex(z=2) == 2");
+  Check(AxialSliceIndex(col, 100.0f) == 3, "AxialSliceIndex clamps high to nz-1");
+  Check(AxialSliceIndex(col, -5.0f) == 0, "AxialSliceIndex clamps low to 0");
+}
+
 }  // namespace
 
 int main() {
@@ -423,6 +505,7 @@ int main() {
   TestShBasis();
   TestIcosphere();
   TestGlyphBuilder();
+  TestGlyphScene();
   TestOdfVolume();
 
   std::cout << "============================\n";

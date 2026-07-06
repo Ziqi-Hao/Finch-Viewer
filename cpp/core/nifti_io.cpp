@@ -226,30 +226,36 @@ Volume LoadNifti(const std::string& path) {
     gzclose(f);
     throw std::runtime_error("cannot seek to NIfTI voxel data: " + path);
   }
-  std::vector<char> raw(nvox * static_cast<std::size_t>(elemBytes));
-  GzReadFull(f, raw.data(), raw.size(), "voxel data");
-  gzclose(f);
-
   Volume vol;
   vol.dims[0] = nx; vol.dims[1] = ny; vol.dims[2] = nz;
   vol.data.resize(nvox);
 
-  auto convert = [&](auto tag) {
-    using T = decltype(tag);
-    const char* p = raw.data();
-    for (std::size_t i = 0; i < nvox; ++i, p += sizeof(T)) {
-      vol.data[i] = ReadElem<T>(p, swap) * sclSlope + sclInter;
+  // Decode the raw voxel bytes into vol.data, then free `raw` at the block's end
+  // — before the sanitize/min-max pass below, which only touches vol.data. For a
+  // float64 source this drops the transient footprint from 12 to 4 bytes/voxel
+  // (only the float result survives), avoiding OOM headroom on large volumes.
+  {
+    std::vector<char> raw(nvox * static_cast<std::size_t>(elemBytes));
+    GzReadFull(f, raw.data(), raw.size(), "voxel data");
+    gzclose(f);
+
+    auto convert = [&](auto tag) {
+      using T = decltype(tag);
+      const char* p = raw.data();
+      for (std::size_t i = 0; i < nvox; ++i, p += sizeof(T)) {
+        vol.data[i] = ReadElem<T>(p, swap) * sclSlope + sclInter;
+      }
+    };
+    switch (datatype) {
+      case DT_UINT8: convert(uint8_t{}); break;
+      case DT_INT8: convert(int8_t{}); break;
+      case DT_INT16: convert(int16_t{}); break;
+      case DT_UINT16: convert(uint16_t{}); break;
+      case DT_INT32: convert(int32_t{}); break;
+      case DT_UINT32: convert(uint32_t{}); break;
+      case DT_FLOAT32: convert(float{}); break;
+      case DT_FLOAT64: convert(double{}); break;
     }
-  };
-  switch (datatype) {
-    case DT_UINT8: convert(uint8_t{}); break;
-    case DT_INT8: convert(int8_t{}); break;
-    case DT_INT16: convert(int16_t{}); break;
-    case DT_UINT16: convert(uint16_t{}); break;
-    case DT_INT32: convert(int32_t{}); break;
-    case DT_UINT32: convert(uint32_t{}); break;
-    case DT_FLOAT32: convert(float{}); break;
-    case DT_FLOAT64: convert(double{}); break;
   }
 
   // Affine: prefer sform, then qform, else diagonal pixdim scaling.

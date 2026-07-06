@@ -13,6 +13,52 @@
 namespace tracto {
 namespace {
 
+// One full pass over the SoA point cloud, OR-ing every in-box point into its
+// owning streamline's flag. OpenMP-parallel (per-thread partials, then reduced)
+// when available; the serial path is result-identical. `flags` must be sized to
+// StreamlineCount() and zero-initialized by the caller. Shared by the linear
+// backend and the grid backend's large-box fallback so the benchmarked ~5x
+// parallel scan (selection_bench.cpp: 29.5ms->5.5ms @ 24M points) is used on
+// both paths instead of being dead code behind the grid.
+void SelectInBoxScan(const TractogramStore& tg, const Bounds& box,
+                     std::vector<uint8_t>& flags) {
+  const std::size_t totalPoints = tg.TotalPointCount();
+  const auto inBox = [&](std::size_t p) {
+    return tg.x[p] >= box.v[0] && tg.x[p] <= box.v[1] && tg.y[p] >= box.v[2] &&
+           tg.y[p] <= box.v[3] && tg.z[p] >= box.v[4] && tg.z[p] <= box.v[5];
+  };
+
+#ifdef HAVE_OPENMP
+  const std::size_t n = tg.StreamlineCount();
+  const int threadCount = omp_get_max_threads();
+  std::vector<std::vector<uint8_t>> partial(
+      static_cast<std::size_t>(threadCount), std::vector<uint8_t>(n, 0));
+
+#pragma omp parallel
+  {
+    const int tid = omp_get_thread_num();
+    std::vector<uint8_t>& local = partial[static_cast<std::size_t>(tid)];
+
+#pragma omp for schedule(static)
+    for (int64_t p = 0; p < static_cast<int64_t>(totalPoints); ++p) {
+      const auto idx = static_cast<std::size_t>(p);
+      if (inBox(idx)) local[static_cast<std::size_t>(tg.sid[idx])] = 1;
+    }
+  }
+
+#pragma omp parallel for schedule(static)
+  for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
+    const auto si = static_cast<std::size_t>(i);
+    uint8_t hit = 0;
+    for (const auto& local : partial) hit = static_cast<uint8_t>(hit || local[si]);
+    flags[si] |= hit;
+  }
+#else
+  for (std::size_t p = 0; p < totalPoints; ++p)
+    if (inBox(p)) flags[static_cast<std::size_t>(tg.sid[p])] = 1;
+#endif
+}
+
 class CpuSelectionBackend final : public SelectionBackend {
  public:
   std::string Name() const override {
@@ -25,50 +71,8 @@ class CpuSelectionBackend final : public SelectionBackend {
 
   std::vector<uint8_t> SelectInBox(const TractogramStore& tractogram,
                                    const Bounds& bounds) const override {
-    const std::size_t n = tractogram.StreamlineCount();
-    const std::size_t totalPoints = tractogram.TotalPointCount();
-    std::vector<uint8_t> flags(n, 0);
-
-#ifdef HAVE_OPENMP
-    const int threadCount = omp_get_max_threads();
-    std::vector<std::vector<uint8_t>> partial(
-        static_cast<std::size_t>(threadCount), std::vector<uint8_t>(n, 0));
-
-#pragma omp parallel
-    {
-      const int tid = omp_get_thread_num();
-      std::vector<uint8_t>& local = partial[static_cast<std::size_t>(tid)];
-
-#pragma omp for schedule(static)
-      for (int64_t p = 0; p < static_cast<int64_t>(totalPoints); ++p) {
-        const auto idx = static_cast<std::size_t>(p);
-        if (tractogram.x[idx] >= bounds.v[0] && tractogram.x[idx] <= bounds.v[1] &&
-            tractogram.y[idx] >= bounds.v[2] && tractogram.y[idx] <= bounds.v[3] &&
-            tractogram.z[idx] >= bounds.v[4] && tractogram.z[idx] <= bounds.v[5]) {
-          local[static_cast<std::size_t>(tractogram.sid[idx])] = 1;
-        }
-      }
-    }
-
-#pragma omp parallel for schedule(static)
-    for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
-      const auto si = static_cast<std::size_t>(i);
-      uint8_t hit = 0;
-      for (const auto& local : partial) {
-        hit = static_cast<uint8_t>(hit || local[si]);
-      }
-      flags[si] = hit;
-    }
-#else
-    for (std::size_t p = 0; p < totalPoints; ++p) {
-      if (tractogram.x[p] >= bounds.v[0] && tractogram.x[p] <= bounds.v[1] &&
-          tractogram.y[p] >= bounds.v[2] && tractogram.y[p] <= bounds.v[3] &&
-          tractogram.z[p] >= bounds.v[4] && tractogram.z[p] <= bounds.v[5]) {
-        flags[static_cast<std::size_t>(tractogram.sid[p])] = 1;
-      }
-    }
-#endif
-
+    std::vector<uint8_t> flags(tractogram.StreamlineCount(), 0);
+    SelectInBoxScan(tractogram, bounds, flags);
     return flags;
   }
 };
@@ -80,19 +84,34 @@ class CpuSelectionBackend final : public SelectionBackend {
 class GridSelectionBackend final : public SelectionBackend {
  public:
   std::string Name() const override { return "Grid (uniform-voxel CSR)"; }
+  bool IndexBuilt() const override { return built_; }
 
-  void Build(const TractogramStore& tg) override {
+  // INVARIANT: Build indexes the FULL point cloud once. Editing mutates only the
+  // caller's alive mask — it never moves or removes points — so the index stays
+  // valid across edits and is deliberately NOT rebuilt on edit (callers intersect
+  // query flags with the alive mask). Do not add a rebuild-on-edit: it would cost
+  // an O(N) counting sort per edit for zero correctness gain.
+  void Build(const TractogramStore& tg, const Bounds* bounds = nullptr) override {
     built_ = false;
     order_.clear();
     start_.clear();
     const std::size_t total = tg.TotalPointCount();
     if (total == 0) return;
 
-    const auto xr = std::minmax_element(tg.x.begin(), tg.x.end());
-    const auto yr = std::minmax_element(tg.y.begin(), tg.y.end());
-    const auto zr = std::minmax_element(tg.z.begin(), tg.z.end());
-    lo_[0] = *xr.first; lo_[1] = *yr.first; lo_[2] = *zr.first;
-    const double hi[3] = {*xr.second, *yr.second, *zr.second};
+    // Reuse the caller's cached RasBounds when supplied — it is the identical
+    // x/y/z minmax the index would compute, and CellIndex clamps every point
+    // into range, so the bucket layout is byte-identical either way.
+    double hi[3];
+    if (bounds != nullptr) {
+      lo_[0] = bounds->v[0]; lo_[1] = bounds->v[2]; lo_[2] = bounds->v[4];
+      hi[0] = bounds->v[1]; hi[1] = bounds->v[3]; hi[2] = bounds->v[5];
+    } else {
+      const auto xr = std::minmax_element(tg.x.begin(), tg.x.end());
+      const auto yr = std::minmax_element(tg.y.begin(), tg.y.end());
+      const auto zr = std::minmax_element(tg.z.begin(), tg.z.end());
+      lo_[0] = *xr.first; lo_[1] = *yr.first; lo_[2] = *zr.first;
+      hi[0] = *xr.second; hi[1] = *yr.second; hi[2] = *zr.second;
+    }
     for (int a = 0; a < 3; ++a)
       dims_[a] = std::max<int64_t>(
           1, static_cast<int64_t>(std::floor((hi[a] - lo_[a]) / cell_)) + 1);
@@ -125,7 +144,7 @@ class GridSelectionBackend final : public SelectionBackend {
                                    const Bounds& box) const override {
     std::vector<uint8_t> flags(tg.StreamlineCount(), 0);
     if (tg.TotalPointCount() == 0) return flags;
-    if (!built_) { LinearScan(tg, box, flags); return flags; }  // safety fallback
+    if (!built_) { SelectInBoxScan(tg, box, flags); return flags; }  // safety fallback
 
     const int64_t ix0 = RangeLo(box.v[0], 0), ix1 = RangeHi(box.v[1], 0);
     const int64_t iy0 = RangeLo(box.v[2], 1), iy1 = RangeHi(box.v[3], 1);
@@ -144,7 +163,7 @@ class GridSelectionBackend final : public SelectionBackend {
                       start_[static_cast<std::size_t>(base + iz0)];
       }
     if (candidates > static_cast<int64_t>(tg.TotalPointCount() / 8)) {
-      LinearScan(tg, box, flags);
+      SelectInBoxScan(tg, box, flags);
       return flags;
     }
 
@@ -175,14 +194,6 @@ class GridSelectionBackend final : public SelectionBackend {
   int64_t RangeHi(double v, int axis) const {
     return std::min<int64_t>(dims_[axis] - 1,
                              static_cast<int64_t>(std::floor((v - lo_[axis]) / cell_)));
-  }
-  void LinearScan(const TractogramStore& tg, const Bounds& box,
-                  std::vector<uint8_t>& flags) const {
-    const std::size_t total = tg.TotalPointCount();
-    for (std::size_t p = 0; p < total; ++p)
-      if (tg.x[p] >= box.v[0] && tg.x[p] <= box.v[1] && tg.y[p] >= box.v[2] &&
-          tg.y[p] <= box.v[3] && tg.z[p] >= box.v[4] && tg.z[p] <= box.v[5])
-        flags[static_cast<std::size_t>(tg.sid[p])] = 1;
   }
 
   double cell_ = 3.0;       // voxel size (mm), matches the Python default

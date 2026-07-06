@@ -57,25 +57,4 @@ std::vector<int> MakeDisplayIndices(int fullCount, int displayN, uint64_t seed) 
   return indices;
 }
 
-std::vector<int> MakeDisplayIndicesFromAlive(const std::vector<uint8_t>& alive,
-                                             int displayN,
-                                             uint64_t seed) {
-  std::vector<int> indices;
-  indices.reserve(alive.size());
-  for (std::size_t i = 0; i < alive.size(); ++i) {
-    if (alive[i]) {
-      indices.push_back(static_cast<int>(i));
-    }
-  }
-
-  if (static_cast<int>(indices.size()) > displayN) {
-    std::mt19937_64 rng(seed);
-    std::shuffle(indices.begin(), indices.end(), rng);
-    indices.resize(static_cast<std::size_t>(displayN));
-    std::sort(indices.begin(), indices.end());
-  }
-
-  return indices;
-}
-
 }  // namespace tracto

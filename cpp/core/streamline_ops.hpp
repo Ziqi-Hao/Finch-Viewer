@@ -16,8 +16,5 @@ std::array<unsigned char, 3> DirectionRgbFromPoints(const float* points,
                                                     std::size_t pointCount,
                                                     std::size_t pointIndex);
 std::vector<int> MakeDisplayIndices(int fullCount, int displayN, uint64_t seed);
-std::vector<int> MakeDisplayIndicesFromAlive(const std::vector<uint8_t>& alive,
-                                             int displayN,
-                                             uint64_t seed);
 
 }  // namespace tracto

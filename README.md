@@ -52,7 +52,7 @@ If your bottleneck is "I want to scrub, rotate, and box-edit big tractograms wit
 | CI | — | none yet |
 | Self-tests | `core_selftest`, `odf_selftest` | passing (count-equivalence + bit-exact round-trip) |
 
-`CMakePresets.json` ships Windows/Linux/vcpkg presets — treat those as **future work** until CI verifies them.
+`CMakePresets.json` ships Windows/Linux/macOS presets; only macOS is built-and-tested — treat Windows/Linux as **future work** until CI verifies them.
 
 ## Build & run (macOS, Homebrew Qt)
 

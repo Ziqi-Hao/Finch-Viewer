@@ -18,7 +18,19 @@ class SelectionBackend {
 
   // Prepare any spatial index for this tractogram. Call once after a load (and
   // again on reload). Default: no-op (the linear scan needs no index).
-  virtual void Build(const TractogramStore& tractogram) { (void)tractogram; }
+  // `bounds`, if given, is the tractogram's RAS AABB (identical to what the
+  // index would compute itself); pass the already-cached RasBounds to skip a
+  // redundant full x/y/z minmax sweep. Ignored by index-free backends.
+  virtual void Build(const TractogramStore& tractogram,
+                     const Bounds* bounds = nullptr) {
+    (void)tractogram;
+    (void)bounds;
+  }
+
+  // True if a spatial index is active after Build(). An index-free backend, or a
+  // grid whose cell count tripped the guard cap (degrading queries to a full
+  // linear scan), returns false — the caller may warn the user.
+  virtual bool IndexBuilt() const { return false; }
 
   // Per-streamline flags: 1 if ANY point of the streamline lies in the box.
   virtual std::vector<uint8_t> SelectInBox(const TractogramStore& tractogram,

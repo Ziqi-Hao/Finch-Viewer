@@ -55,6 +55,9 @@ class MainWindow : public QMainWindow {
   // Headless slice-following check: jump the slice focus to world Z and rebuild the
   // resident ODF/peaks glyphs there (so a screenshot shows that slice).
   void DebugScrubToZ(float z);
+  // Headless stats check: compute + show the Properties stats (incl. volume-on-tract)
+  // without a button click, so a window-shot captures them.
+  void DebugRefreshStats() { RefreshStats(); }
 
   // Headless edit smoke test: delete the viewport's current box and report the
   // alive counts (verifies the box -> selection -> aliveFull pipeline).

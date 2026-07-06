@@ -5,15 +5,15 @@ iteration surface; C++ is catching up to match it):
 
 - `python/` — the Python reference editor and **behavior source of truth**.
   Entry: `python/local_editor.py`; logic in the `python/trkedit/` package
-  (`tractogram`, `fa`, `selection`, `render`, `diagnostics`, `interaction`,
-  `editor`). Run from the `trkedit` conda env (Ubuntu-22.04 WSL):
+  (`tractogram`, `volume`, `selection`, `render`, `diagnostics`, `interaction`,
+  `editor`, `ui`). Run from the `trkedit` conda env (Ubuntu-22.04 WSL):
   `python python/local_editor.py --fa FA.nii.gz --trk in.trk --out out.trk`
   (`scilpy_env`'s VTK is a headless EGL-only build and cannot open a window).
 - `cpp/` + `CMakeLists.txt` + `tools/` — the C++ toolbox port. All C++ lives
   under `cpp/`: `cpp/core/` is the shared, UI-free io/data/compute library
-  (`tracto_core`); the apps are `cpp/qt/` (the primary Qt + OpenGL editor),
-  `cpp/glfw/`, and the opt-in legacy `cpp/vtk/`. Each app folder holds its
-  `main.cpp` next to its own code. Build/run via the `tools/` scripts
+  (`tracto_core`) and `cpp/odf/` is the pure-CPU ODF/glyph library (`tracto_odf`);
+  the sole app is `cpp/qt/`, the Qt + RHI (Metal) editor (`local_editor_qt`),
+  holding its `main.cpp` next to its own code. Build/run via the `tools/` scripts
   (`tools/build_mac.sh` on macOS; see [DEV_WORKFLOW.md](DEV_WORKFLOW.md)).
 
 Shared `.trk`/`.nii.gz` data lives in `data/` (gitignored) so both

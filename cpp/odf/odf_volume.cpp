@@ -295,10 +295,6 @@ OdfVolume LoadOdfNifti(const std::string& path) {
     throw std::runtime_error("cannot seek to ODF NIfTI voxel data: " + path);
   }
 
-  std::vector<char> raw(nElem * static_cast<std::size_t>(elemBytes));
-  GzReadFull(f, raw.data(), raw.size(), "voxel data");
-  gzclose(f);
-
   OdfVolume out;
   out.dims[0] = nx;
   out.dims[1] = ny;
@@ -306,27 +302,37 @@ OdfVolume LoadOdfNifti(const std::string& path) {
   out.nCoeffs = nt;
   out.coeffs.resize(nElem);
 
+  // Decode the raw voxel bytes into out.coeffs, then free `raw` at the block's
+  // end — before the value-range scan below, which only touches out.coeffs. For a
+  // float64 source this drops the transient footprint from 12 to 4 bytes/element.
+  //
   // The on-disk layout for a 4D NIfTI is coefficient-OUTERMOST already:
   //   flat = c*(nx*ny*nz) + k*(nx*ny) + j*nx + i
   // which is exactly OdfVolume::coeffIndex. So the linear element order on disk
   // equals our linear buffer order: a single straight scan converts in place,
   // no per-voxel gather needed. (Verified against nii_volume.h:95-118.)
-  auto convert = [&](auto tag) {
-    using T = decltype(tag);
-    const char* p = raw.data();
-    for (std::size_t i = 0; i < nElem; ++i, p += sizeof(T)) {
-      out.coeffs[i] = ReadElem<T>(p, swap) * sclSlope + sclInter;
+  {
+    std::vector<char> raw(nElem * static_cast<std::size_t>(elemBytes));
+    GzReadFull(f, raw.data(), raw.size(), "voxel data");
+    gzclose(f);
+
+    auto convert = [&](auto tag) {
+      using T = decltype(tag);
+      const char* p = raw.data();
+      for (std::size_t i = 0; i < nElem; ++i, p += sizeof(T)) {
+        out.coeffs[i] = ReadElem<T>(p, swap) * sclSlope + sclInter;
+      }
+    };
+    switch (datatype) {
+      case DT_UINT8: convert(uint8_t{}); break;
+      case DT_INT8: convert(int8_t{}); break;
+      case DT_INT16: convert(int16_t{}); break;
+      case DT_UINT16: convert(uint16_t{}); break;
+      case DT_INT32: convert(int32_t{}); break;
+      case DT_UINT32: convert(uint32_t{}); break;
+      case DT_FLOAT32: convert(float{}); break;
+      case DT_FLOAT64: convert(double{}); break;
     }
-  };
-  switch (datatype) {
-    case DT_UINT8: convert(uint8_t{}); break;
-    case DT_INT8: convert(int8_t{}); break;
-    case DT_INT16: convert(int16_t{}); break;
-    case DT_UINT16: convert(uint16_t{}); break;
-    case DT_INT32: convert(int32_t{}); break;
-    case DT_UINT32: convert(uint32_t{}); break;
-    case DT_FLOAT32: convert(float{}); break;
-    case DT_FLOAT64: convert(double{}); break;
   }
 
   // Affine: prefer sform (sform_code>0), then qform (qform_code>0), else the

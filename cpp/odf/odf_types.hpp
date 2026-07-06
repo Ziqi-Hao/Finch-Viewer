@@ -2,11 +2,11 @@
 
 // Small self-contained POD types for the pure-CPU ODF module.
 //
-// WHY a private Vec3/Affine instead of cpp/core/render_math.hpp's Vec3/Mat4:
+// WHY a private Vec3/Affine instead of cpp/core/mat_math.hpp's Vec3/Mat4:
 // the ODF foundation is intentionally standalone (CPU-only, zlib + C++17 stdlib
 // only — no GL/Qt) so it can be unit-tested and reused without dragging in the
 // renderer's math/camera. To stay link-safe if a future translation unit pulls
-// in BOTH this header and render_math.hpp, every ODF type lives in the nested
+// in BOTH this header and mat_math.hpp, every ODF type lives in the nested
 // namespace `tracto::odf`, so `tracto::odf::Vec3` never collides with
 // `tracto::Vec3`. Header-only, no dependencies beyond <array>/<cstddef>.
 
@@ -55,7 +55,7 @@ struct VoxelIndex {
 };
 
 // 4x4 row-major homogeneous affine: voxel index (i, j, k) -> world RAS mm.
-// Row-major matches cpp/core/render_math.hpp's Mat4 so the world coordinates
+// Row-major matches cpp/core/mat_math.hpp's Mat4 so the world coordinates
 // this produces line up exactly with the streamline/scalar-volume space, even
 // though we deliberately do not share that type. Row r, column c is m[r*4 + c].
 // The bottom row is conventionally (0, 0, 0, 1).

@@ -1,12 +1,15 @@
+#include "nifti_io.hpp"
 #include "selection_backend.hpp"
 #include "statistics.hpp"
 #include "tractogram_store.hpp"
 #include "trk_io.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -117,18 +120,26 @@ void TestSelectionBackends() {
   tracto::TractogramStore store = MakeStore();
   auto cpu = tracto::CreateCpuSelectionBackend();
   auto grid = tracto::CreateGridSelectionBackend();
+  auto gridCached = tracto::CreateGridSelectionBackend();
   cpu->Build(store);
   grid->Build(store);
+  // Build() with a caller-supplied AABB must produce a byte-identical index to
+  // the internal-minmax path (guards the cached-RasBounds fast path).
+  const tracto::Bounds aabb = tracto::RasBounds(store);
+  gridCached->Build(store, &aabb);
 
   const std::vector<tracto::Bounds> boxes = {
       {{-0.5, 1.5, -0.5, 0.5, -0.5, 0.5}},
       {{-3.0, -1.0, 0.5, 1.5, -0.5, 0.5}},
-      {{-100.0, 100.0, -100.0, 100.0, -100.0, 100.0}},
+      {{-100.0, 100.0, -100.0, 100.0, -100.0, 100.0}},  // large box -> parallel-scan fallback
       {{20.0, 21.0, 20.0, 21.0, 20.0, 21.0}},
   };
   for (std::size_t i = 0; i < boxes.size(); ++i) {
-    Check(cpu->SelectInBox(store, boxes[i]) == grid->SelectInBox(store, boxes[i]),
+    const std::vector<uint8_t> expect = cpu->SelectInBox(store, boxes[i]);
+    Check(expect == grid->SelectInBox(store, boxes[i]),
           "CPU and grid selection agree for box " + std::to_string(i));
+    Check(expect == gridCached->SelectInBox(store, boxes[i]),
+          "cached-bounds grid agrees with CPU for box " + std::to_string(i));
   }
 }
 
@@ -149,6 +160,123 @@ void TestTrkSubsetRoundTrip() {
   std::remove(path.c_str());
 }
 
+// Grayscale histogram, signed-stat histogram, and label LUT — the numeric policy
+// that moved out of the Qt shell (main_window) into cpp/core/statistics.
+void TestVolumeHistograms() {
+  // Grayscale ramp 0..99: every voxel counted, default window == [dispMin,dispMax].
+  tracto::Volume ramp;
+  ramp.dims[0] = 100; ramp.dims[1] = 1; ramp.dims[2] = 1;
+  ramp.data.resize(100);
+  for (int i = 0; i < 100; ++i) ramp.data[static_cast<std::size_t>(i)] = static_cast<float>(i);
+  ramp.valueMin = 0.0f; ramp.valueMax = 99.0f;
+
+  const tracto::VolumeHistogram gh = tracto::ComputeVolumeHistogram(ramp);
+  double binSum = 0.0;
+  for (float b : gh.bins) binSum += b;
+  Check(Near(binSum, 100.0), "volume histogram bins sum to voxel count");
+  Check(Near(gh.dispMin, 0.0) && gh.dispMax > gh.dispMin, "volume disp range ordered from 0");
+  Check(Near(gh.winLo, gh.dispMin) && Near(gh.winHi, gh.dispMax),
+        "volume default window == [dispMin, dispMax]");
+
+  // Signed stat map (z-score intent): |stat| axis from 0, threshold below cap,
+  // histogram counts only the non-zero voxels (background excluded).
+  tracto::Volume stat;
+  stat.dims[0] = 8; stat.dims[1] = 1; stat.dims[2] = 1;
+  stat.data = {0.0f, 0.0f, -1.0f, 2.0f, -4.0f, 5.0f, 8.0f, -9.0f};  // 6 non-zero
+  stat.valueMin = -9.0f; stat.valueMax = 8.0f;
+  const tracto::VolumeHistogram sh = tracto::ComputeStatHistogram(stat, /*intent=*/5);
+  double statSum = 0.0;
+  for (float b : sh.bins) statSum += b;
+  Check(Near(statSum, 6.0), "stat histogram counts only non-zero voxels");
+  Check(Near(sh.dispMin, 0.0), "stat axis starts at 0 (|stat|)");
+  Check(sh.winLo < sh.winHi && sh.winLo >= 0.0f, "stat threshold below cap, non-negative");
+
+  // Integer label volume 0..3: width == maxLabel+1, index 0 transparent, others opaque.
+  tracto::Volume labels;
+  labels.dims[0] = 6; labels.dims[1] = 1; labels.dims[2] = 1;
+  labels.data = {0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f};
+  labels.valueMin = 0.0f; labels.valueMax = 3.0f;
+  const tracto::LabelLut lut = tracto::ComputeLabelLut(labels);
+  Check(lut.width == 4, "label LUT width == maxLabel + 1");
+  Check(lut.rgba.size() == 16, "label LUT rgba size == width*4");
+  Check(Near(lut.rgba[3], 0.0), "label 0 (background) is transparent");
+  Check(Near(lut.rgba[7], 1.0) && Near(lut.rgba[11], 1.0), "non-zero labels are opaque");
+}
+
+// "Volume on tract" sampler: nearest-voxel sampling of a scalar volume along the
+// alive streamline points, with out-of-bounds and dead-streamline points dropped.
+void TestVolumeOnTract() {
+  // Identity affine -> world coord == voxel index. Values 10/20/30/40 at x=0..3.
+  tracto::Volume vol;
+  vol.dims[0] = 4; vol.dims[1] = 1; vol.dims[2] = 1;
+  vol.data = {10.0f, 20.0f, 30.0f, 40.0f};
+  vol.voxelToWorld = tracto::Identity();
+  vol.valueMin = 10.0f; vol.valueMax = 40.0f;
+
+  // 6 points: 0..3 sample voxels 0..3 (sid 0, alive); point 4 is out of bounds;
+  // point 5 belongs to a DEAD streamline (sid 1) and must be excluded.
+  tracto::TractogramStore store;
+  store.streamlines.resize(2);
+  store.x = {0.0f, 1.0f, 2.0f, 3.0f, 100.0f, 0.0f};
+  store.y = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  store.z = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  store.sid = {0, 0, 0, 0, 0, 1};
+  const std::vector<uint8_t> alive = {1, 0};
+
+  const tracto::NumericSummary vs = tracto::SampleVolumeAlongTracts(store, vol, alive);
+  Check(vs.valid, "volume-on-tract summary is valid");
+  Check(Near(vs.mean, 25.0), "volume-on-tract mean == 25 (10,20,30,40)");
+  Check(Near(vs.min, 10.0) && Near(vs.max, 40.0), "volume-on-tract min/max == 10/40");
+  Check(Near(vs.median, 25.0), "volume-on-tract median == 25");
+
+  // Empty volume -> invalid (no crash).
+  Check(!tracto::SampleVolumeAlongTracts(store, tracto::Volume{}, alive).valid,
+        "empty volume -> invalid summary");
+}
+
+// Big-endian .trk load: a byte-swapped header must normalize and the point floats
+// must swap to native values (interop with BE-written tractograms / nibabel).
+void TestBigEndianTrk() {
+  std::vector<char> hdr(static_cast<std::size_t>(tracto::kTrkHeaderSize), 0);
+  std::memcpy(hdr.data(), "TRACK", 5);
+  auto putBE = [&](std::size_t off, const void* src, std::size_t n) {
+    std::memcpy(hdr.data() + off, src, n);
+    std::reverse(hdr.data() + off, hdr.data() + off + n);
+  };
+  const int16_t zero16 = 0;
+  const int32_t one32 = 1;
+  const int32_t hdrSz = tracto::kTrkHeaderSize;
+  putBE(36, &zero16, 2);   // n_scalars = 0
+  putBE(238, &zero16, 2);  // n_properties = 0
+  putBE(988, &one32, 4);   // n_count = 1
+  putBE(996, &hdrSz, 4);   // hdr_size = 1000, byte-swapped (marks BE)
+
+  const std::string path =
+      (std::filesystem::temp_directory_path() / "tracto_be_selftest.trk").string();
+  {
+    std::ofstream out(path, std::ios::binary);
+    out.write(hdr.data(), static_cast<std::streamsize>(hdr.size()));
+    auto writeBE = [&](const void* src, std::size_t n) {
+      char b[8];
+      std::memcpy(b, src, n);
+      std::reverse(b, b + n);
+      out.write(b, static_cast<std::streamsize>(n));
+    };
+    const int32_t pc = 2;
+    writeBE(&pc, 4);                              // 2 points, big-endian
+    for (float f : {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f}) writeBE(&f, 4);
+  }
+
+  tracto::TrkHeader h;
+  const std::vector<tracto::Streamline> sl = tracto::LoadTrk(path, h);
+  Check(h.nCount == 1, "BE .trk: n_count normalized to 1");
+  Check(sl.size() == 1 && sl[0].pointCount == 2, "BE .trk: one 2-point streamline");
+  Check(sl.size() == 1 && sl[0].rawPointData.size() == 6 &&
+            Near(sl[0].rawPointData[0], 1.0) && Near(sl[0].rawPointData[5], 6.0),
+        "BE .trk: point floats byte-swapped to native");
+  std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -156,6 +284,9 @@ int main() {
   TestSlimRehydrate();
   TestSelectionBackends();
   TestTrkSubsetRoundTrip();
+  TestVolumeHistograms();
+  TestVolumeOnTract();
+  TestBigEndianTrk();
   if (failures != 0) {
     std::cout << failures << " core self-test failure(s)\n";
     return 1;

@@ -22,6 +22,32 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # the objects it actually references.
 
 find_package(ZLIB REQUIRED)   # NIfTI .nii.gz decompression (cpp/core/nifti_io)
+
+# OpenMP: Apple Clang ships no OpenMP runtime and FindOpenMP can't auto-discover
+# the `-Xclang -fopenmp` + Homebrew libomp combo, so it silently leaves
+# selection_backend's #pragma omp paths single-threaded. Spell the flags out so
+# find_package(OpenMP) validates and lights them up. (No-op off macOS / no libomp.)
+if(APPLE AND NOT OpenMP_CXX_FLAGS)
+  execute_process(COMMAND brew --prefix libomp
+                  OUTPUT_VARIABLE _brew_libomp
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  # Prefer the STATIC libomp.a so the shipped Finch-Viewer.app self-contains the
+  # OpenMP runtime: end users need NO libomp install and there's nothing extra to
+  # bundle. Fall back to the dylib; absent entirely -> serial build (no error).
+  set(_omp_lib "")
+  if(_brew_libomp AND EXISTS "${_brew_libomp}/lib/libomp.a")
+    set(_omp_lib "${_brew_libomp}/lib/libomp.a")
+  elseif(_brew_libomp AND EXISTS "${_brew_libomp}/lib/libomp.dylib")
+    set(_omp_lib "${_brew_libomp}/lib/libomp.dylib")
+  endif()
+  if(_omp_lib)
+    set(OpenMP_C_FLAGS "-Xclang -fopenmp -I${_brew_libomp}/include")
+    set(OpenMP_C_LIB_NAMES "omp")
+    set(OpenMP_CXX_FLAGS "-Xclang -fopenmp -I${_brew_libomp}/include")
+    set(OpenMP_CXX_LIB_NAMES "omp")
+    set(OpenMP_omp_LIBRARY "${_omp_lib}")
+  endif()
+endif()
 find_package(OpenMP)
 
 # ── core library: the VTK/Qt-free io/data/compute modules ───────────────────
@@ -53,6 +79,11 @@ if(BUILD_TESTING)
   add_executable(core_selftest cpp/core/core_selftest.cpp)
   target_link_libraries(core_selftest PRIVATE tracto_core)
   add_test(NAME core_selftest COMMAND core_selftest)
+
+  # Manual-run perf check (no add_test — needs a .trk path argument). Documents
+  # the OpenMP win on the parallelized selection scan; see the file header.
+  add_executable(selection_bench cpp/core/selection_bench.cpp)
+  target_link_libraries(selection_bench PRIVATE tracto_core)
 endif()
 
 # ── ODF foundation: pure-CPU SH-coefficient ODF load + glyph mesh build ──────
@@ -66,6 +97,7 @@ add_library(tracto_odf STATIC
   cpp/odf/icosphere.cpp
   cpp/odf/glyph_builder.cpp
   cpp/odf/discrete_sphere.cpp
+  cpp/odf/glyph_scene.cpp
 )
 target_include_directories(tracto_odf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp/odf)
 target_link_libraries(tracto_odf PUBLIC ZLIB::ZLIB)

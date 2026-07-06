@@ -21,6 +21,41 @@ void WriteLE(char* ptr, T value) {
   std::memcpy(ptr, &value, sizeof(T));
 }
 
+template <typename T>
+T ByteSwap(T value) {
+  char* p = reinterpret_cast<char*>(&value);
+  std::reverse(p, p + sizeof(T));
+  return value;
+}
+
+// Reverse the bytes of `count` little/big-endian elements of `elemSize` bytes at
+// `offset` within the raw header — in place.
+void SwapHeaderField(std::array<char, kTrkHeaderSize>& raw, std::size_t offset,
+                     std::size_t elemSize, std::size_t count) {
+  for (std::size_t i = 0; i < count; ++i) {
+    char* p = raw.data() + offset + i * elemSize;
+    std::reverse(p, p + elemSize);
+  }
+}
+
+// Convert a big-endian TrackVis header to little-endian in place: byte-swap every
+// numeric field the format defines (char/text fields are byte-order-agnostic).
+// After this the header reads correctly via ReadLE AND WriteTrkSubset re-emits a
+// valid little-endian file — swapping only the fields we read would otherwise
+// leave a corrupt mixed-endian header on save.
+void NormalizeTrkHeaderToLE(std::array<char, kTrkHeaderSize>& raw) {
+  SwapHeaderField(raw, 6, 2, 3);     // dim[3]                      int16
+  SwapHeaderField(raw, 12, 4, 3);    // voxel_size[3]              float32
+  SwapHeaderField(raw, 24, 4, 3);    // origin[3]                  float32
+  SwapHeaderField(raw, 36, 2, 1);    // n_scalars                   int16
+  SwapHeaderField(raw, 238, 2, 1);   // n_properties                int16
+  SwapHeaderField(raw, 440, 4, 16);  // vox_to_ras[4][4]           float32
+  SwapHeaderField(raw, 956, 4, 6);   // image_orientation_patient  float32
+  SwapHeaderField(raw, 988, 4, 1);   // n_count                     int32
+  SwapHeaderField(raw, 992, 4, 1);   // version                     int32
+  SwapHeaderField(raw, 996, 4, 1);   // hdr_size                    int32
+}
+
 bool LooksLikeZeroMatrix(const std::array<double, 16>& m) {
   double sum = 0.0;
   for (double x : m) {
@@ -40,18 +75,29 @@ void MakeFallbackVoxToRas(TrkHeader& header) {
   header.voxToRas[11] = header.origin[2];
 }
 
-TrkHeader ParseTrkHeader(const std::array<char, kTrkHeaderSize>& raw) {
+// Parses the 1000-byte header. `bigEndian` is set true when the source was a
+// big-endian .trk (its numeric fields are normalized to LE in header.raw here);
+// LoadTrk then byte-swaps the point/property floats to match.
+TrkHeader ParseTrkHeader(std::array<char, kTrkHeaderSize> raw, bool& bigEndian) {
   TrkHeader header;
-  header.raw = raw;
+  bigEndian = false;
 
   if (std::memcmp(raw.data(), "TRACK", 5) != 0) {
     throw std::runtime_error("input is not a TrackVis .trk file");
   }
 
-  const int32_t hdrSize = ReadLE<int32_t>(raw.data() + 996);
+  int32_t hdrSize = ReadLE<int32_t>(raw.data() + 996);
   if (hdrSize != kTrkHeaderSize) {
-    throw std::runtime_error("unsupported .trk endian/header size");
+    // A big-endian .trk stores hdr_size = 1000 byte-swapped. Normalize the whole
+    // header to little-endian so the reads below and any later save stay valid.
+    if (ByteSwap<int32_t>(hdrSize) == kTrkHeaderSize) {
+      bigEndian = true;
+      NormalizeTrkHeaderToLE(raw);
+    } else {
+      throw std::runtime_error("unsupported .trk endian/header size");
+    }
   }
+  header.raw = raw;
 
   header.voxelSize[0] = ReadLE<float>(raw.data() + 12);
   header.voxelSize[1] = ReadLE<float>(raw.data() + 16);
@@ -90,7 +136,8 @@ std::vector<Streamline> LoadTrk(const std::string& path, TrkHeader& header) {
   if (in.gcount() != kTrkHeaderSize) {
     throw std::runtime_error("truncated .trk header");
   }
-  header = ParseTrkHeader(rawHeader);
+  bool bigEndian = false;
+  header = ParseTrkHeader(rawHeader, bigEndian);
 
   const int pointComponents = 3 + header.nScalars;
   std::vector<Streamline> streamlines;
@@ -107,6 +154,7 @@ std::vector<Streamline> LoadTrk(const std::string& path, TrkHeader& header) {
       }
       throw std::runtime_error("truncated .trk streamline count");
     }
+    if (bigEndian) pointCount = ByteSwap(pointCount);
     if (pointCount < 0 || pointCount > 10000000) {
       throw std::runtime_error("invalid .trk streamline point count");
     }
@@ -119,6 +167,8 @@ std::vector<Streamline> LoadTrk(const std::string& path, TrkHeader& header) {
     if (!in) {
       throw std::runtime_error("truncated .trk point data");
     }
+    if (bigEndian)
+      for (float& f : sl.rawPointData) f = ByteSwap(f);
 
     sl.properties.resize(static_cast<std::size_t>(header.nProperties));
     if (!sl.properties.empty()) {
@@ -127,6 +177,8 @@ std::vector<Streamline> LoadTrk(const std::string& path, TrkHeader& header) {
       if (!in) {
         throw std::runtime_error("truncated .trk property data");
       }
+      if (bigEndian)
+        for (float& f : sl.properties) f = ByteSwap(f);
     }
 
     // RAS points are derived on demand in BuildSoA (transform applied straight

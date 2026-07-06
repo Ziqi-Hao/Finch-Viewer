@@ -5,9 +5,9 @@
 The editor should keep one stable interaction model while allowing the compute
 backend to improve over time:
 
-- Rendering should stay on GPU through VTK/OpenGL vertex buffers.
+- Rendering should stay on GPU through Qt RHI vertex buffers (Metal on macOS).
 - Selection/statistics should use contiguous SoA data first, then switchable
-  CPU/OpenMP, CUDA, or VTK-m backends.
+  CPU/OpenMP or GPU backends.
 - Editing state should always be exact on the full streamline set; display
   sampling is only a visualization policy.
 - File saving should preserve source `.trk` metadata and point data whenever
@@ -17,7 +17,7 @@ backend to improve over time:
 
 ## Engineering Rules
 
-- Core data and compute modules should not depend on VTK.
+- Core data and compute modules should not depend on the renderer (Qt/RHI).
 - Render modules should not own editing semantics.
 - Interaction modules should mutate state through explicit commands.
 - GPU/CPU backend choices should sit behind small interfaces, not leak through
@@ -41,10 +41,11 @@ backend to improve over time:
 ## C++ Modules
 
 > Layout note: the tree is organized as `cpp/core/` (the `tracto_core` library:
-> io/data/compute) plus one folder per app — `cpp/qt/`, `cpp/glfw/`, `cpp/vtk/`,
-> each with its own `main.cpp`. The per-module file paths below predate that move
-> (e.g. `cpp/trk_io.*` is now `cpp/core/trk_io.*`, `cpp/editor_app.*` is
-> `cpp/vtk/editor_app.*`); the module responsibilities still hold.
+> io/data/compute), `cpp/odf/` (the `tracto_odf` ODF/glyph library), and the
+> single app `cpp/qt/` (the Qt + RHI editor). The per-module file paths below
+> predate that move (e.g. `cpp/trk_io.*` is now `cpp/core/trk_io.*`, and the
+> render/interaction code now lives in `cpp/qt/`); the module responsibilities
+> still hold.
 
 ### app
 
@@ -52,8 +53,8 @@ Entry point, CLI, application startup.
 
 Current files:
 
-- `local_editor.cpp`
-- `cpp/args.*`
+- `cpp/qt/main.cpp`
+- `cpp/core/args.*`
 
 ### data
 
@@ -61,14 +62,15 @@ Data models shared by CPU and GPU backends.
 
 Current files:
 
-- `cpp/tractogram_store.*`
-- `cpp/bounds.hpp`
+- `cpp/core/tractogram_store.*`
+- `cpp/core/bounds.hpp`
 
 Responsibilities:
 
 - Own raw `.trk` streamlines for lossless save.
 - Own SoA RASMM buffers: `x`, `y`, `z`, `sid`, `offsets`.
-- Own derived arrays: point counts, streamline lengths, later FA-per-point.
+- Own derived arrays: streamline lengths (points-per-line is derived from
+  `offsets`, not stored), later FA-per-point.
 - Expose GPU-ready buffer views without UI dependencies.
 
 ### io
@@ -77,7 +79,8 @@ File loading and saving.
 
 Current files:
 
-- `cpp/trk_io.*`
+- `cpp/core/trk_io.*`
+- `cpp/core/nifti_io.*`
 
 Next:
 
@@ -91,9 +94,14 @@ Pure algorithms independent of VTK UI.
 
 Current files:
 
-- `cpp/streamline_ops.*`
-- `cpp/selection_backend.*`
-- `cpp/statistics.*`
+- `cpp/core/streamline_ops.*`
+- `cpp/core/selection_backend.*`
+- `cpp/core/statistics.*`
+- `cpp/core/display_geometry.*`
+- `cpp/core/track_density.*`
+
+On-disk checks: `cpp/core/core_selftest.cpp`, `cpp/odf/odf_selftest.cpp`,
+`cpp/core/selection_bench.cpp` (manual perf run).
 
 Backend plan:
 
@@ -110,30 +118,20 @@ Algorithm order:
 
 ### render
 
-VTK scene and drawable geometry.
+Scene and drawable geometry.
 
 Current location:
 
-- mostly `cpp/editor_app.*`
-- GLFW/OpenGL proof path: `cpp/glfw_tract_viewer.*`
-
-Target split:
-
-- `render/vtk_scene.*`
-- `render/vtk_streamlines.*`
-- `render/vtk_fa_slices.*`
-- `render/overlays.*`
+- `cpp/qt/tract_viewport.*` (the QRhiWidget: RHI pipelines, buffers, camera)
+- `cpp/qt/main_window.*` (display-geometry build wiring)
+- RHI shaders in `cpp/qt/rhi/` (`line`, `point`, `slice`, `glyph`)
 
 GPU priorities:
 
-- Keep streamline geometry in VTK `vtkPolyData`/OpenGL buffers.
-- Prefer the GLFW/OpenGL route if VTK's Win32 onscreen present path remains
-  unreliable; this matches `dmri-explorer` and gives us direct VBO/shader
-  control.
+- Keep streamline/glyph geometry in RHI vertex buffers; one pipeline per layer.
 - Avoid rebuilding all geometry for small visibility changes where possible.
 - Rebuild sampled display geometry only when alive mask or display cap changes.
-- Later: use cell visibility arrays, mapper selection, or multiple actors for
-  faster hide/show.
+- Later: per-streamline visibility on the GPU for faster hide/show.
 
 ### interaction
 
@@ -141,7 +139,7 @@ Editing state and commands.
 
 Current location:
 
-- mostly `cpp/editor_app.*`
+- mostly `cpp/qt/main_window.*` (history/undo, keep/delete-in-box commands)
 
 Target split:
 
@@ -168,7 +166,7 @@ Target split:
 
 Metrics to show:
 
-- OpenGL renderer
+- RHI backend (Metal on macOS)
 - FPS
 - CPU utilization
 - GPU utilization and memory when available

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# macOS build entry point (counterpart to build_release.ps1 on Windows).
+# macOS build entry point.
 # Configures with Ninja against the Homebrew toolchain and builds Release.
 #
 #   ./tools/build_mac.sh                 # build everything found
 #   ./tools/build_mac.sh local_editor_qt # build just the Qt editor
 #
 # Prerequisites (one-time):
-#   brew install cmake ninja vtk        # vtk pulls in qtbase (Qt6) for the Qt path
+#   brew install cmake ninja qt libomp  # Qt6 (qtbase + qtshadertools qsb) + OpenMP
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

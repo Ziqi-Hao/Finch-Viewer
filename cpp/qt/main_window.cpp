@@ -13,12 +13,9 @@
 #include "utils.hpp"
 #include "viewport_hud.hpp"
 
-// ODF (SH-coefficient) load + CPU glyph build — the standalone tracto_odf lib.
+// ODF (SH-coefficient) load + CPU glyph/peaks scene build — the standalone tracto_odf lib.
 #include "odf_volume.hpp"
-#include "sh_basis.hpp"
-#include "icosphere.hpp"
-#include "glyph_builder.hpp"
-#include "discrete_sphere.hpp"  // embedded symmetric362 for sphere-sampled (SF) ODFs
+#include "glyph_scene.hpp"  // BuildOdfGlyphScene/BuildPeaksScene + fODF/peaks classifiers
 
 #include <QAction>
 #include <QCloseEvent>
@@ -88,360 +85,15 @@ QString StatUnits(int intentCode) {
   }
 }
 
-// A drawable ODF glyph scene handed to the viewport: interleaved
-// [pos.xyz, normal.xyz, rgb] vertices + a uint32 triangle index list + the world
-// (RAS) bounds, plus a little metadata for the status line.
-struct OdfGlyphScene {
-  std::vector<float> vertices;          // 9 floats/vertex
-  std::vector<std::uint32_t> indices;   // triangle list into `vertices`
-  Bounds bounds{};                      // world AABB (padded for the glyph radii)
-  std::size_t glyphCount = 0;
-  int lMax = 0;
-  bool sliced = false;                  // true when only one axial slice is drawn
-                                        // (whole-volume too big) -> can follow scrubbing
-};
-
-// Pack a built GlyphMesh into a drawable scene: interleave [pos, normal, rgb] verts,
-// copy the index list, and frame the bounds on the ACTUAL glyph vertices (a one-slice
-// subset would otherwise be lost in the empty voxel grid). Shared by the SH and
-// discrete-sphere builders. Leaves the scene empty (caller checks) if the mesh is empty.
-void FillSceneFromMesh(OdfGlyphScene& scene, const tracto::odf::GlyphMesh& mesh,
-                       std::size_t glyphCount) {
-  if (mesh.positions.empty()) return;
-  scene.vertices.reserve(mesh.positions.size() * 9);
-  for (std::size_t v = 0; v < mesh.positions.size(); ++v) {
-    const auto& p = mesh.positions[v];
-    const auto& n = mesh.normals[v];
-    const auto& c = mesh.colors[v];
-    scene.vertices.insert(scene.vertices.end(), {p.x, p.y, p.z, n.x, n.y, n.z, c.x, c.y, c.z});
-  }
-  scene.indices.assign(mesh.indices.begin(), mesh.indices.end());
-  const auto& p0 = mesh.positions[0];
-  float lo[3] = {p0.x, p0.y, p0.z}, hi[3] = {p0.x, p0.y, p0.z};
-  for (const auto& p : mesh.positions) {
-    lo[0] = std::min(lo[0], p.x); hi[0] = std::max(hi[0], p.x);
-    lo[1] = std::min(lo[1], p.y); hi[1] = std::max(hi[1], p.y);
-    lo[2] = std::min(lo[2], p.z); hi[2] = std::max(hi[2], p.z);
-  }
-  scene.bounds.v[0] = lo[0]; scene.bounds.v[1] = hi[0];
-  scene.bounds.v[2] = lo[1]; scene.bounds.v[3] = hi[1];
-  scene.bounds.v[4] = lo[2]; scene.bounds.v[5] = hi[2];
-  scene.glyphCount = glyphCount;
-}
-
-// Memoized (icosphere, SH basis matrix) for a given (subdiv, nCoeffs). Both are pure
-// functions of those two, but BuildShBasisMatrix evaluates the SH basis at every sphere
-// vertex (nDir·nCoeffs transcendental terms) — rebuilding it on every slice scrub is pure
-// waste, since (subdiv, nCoeffs) are stable across scrubs of one volume. A one-entry cache
-// (not a map) suffices: subdiv only flips at the 512-glyph budget boundary, rarely mid-scrub.
-const std::pair<tracto::odf::Icosphere, tracto::odf::ShBasisMatrix>& CachedGlyphBasis(int subdiv,
-                                                                                      int nCoeffs) {
-  using namespace tracto::odf;
-  static int cachedSubdiv = -1, cachedNCoeffs = -1;
-  static std::pair<Icosphere, ShBasisMatrix> cache;
-  if (subdiv != cachedSubdiv || nCoeffs != cachedNCoeffs) {
-    Icosphere ico = MakeIcosphere(subdiv);
-    ShBasisMatrix B = BuildShBasisMatrix(ico.vertices, InferShOrder(static_cast<std::size_t>(nCoeffs)));
-    cache = {std::move(ico), std::move(B)};
-    cachedSubdiv = subdiv;
-    cachedNCoeffs = nCoeffs;
-  }
-  return cache;
-}
-
-// Reconstruct a bounded set of ODF glyphs on the CPU (cpp/odf). Bounded on purpose:
-// a whole-brain fODF has far too many voxels to draw every glyph (hundreds of verts
-// each), so above a budget we show ONE axial slice (`sliceK`, or the centre when
-// sliceK<0), striding within it if even that is too big. The 3x3x3 demo shows all 27.
-// `sliceK` lets the caller follow the scrub focus (slice-following).
-OdfGlyphScene BuildOdfGlyphScene(const tracto::odf::OdfVolume& vol, int sliceK = -1) {
-  using namespace tracto::odf;
-  OdfGlyphScene scene;
-  if (vol.empty() || vol.nCoeffs <= 0) return scene;
-
-  const int nx = vol.dims[0], ny = vol.dims[1], nz = vol.dims[2];
-
-  // Keep only voxels with real signal: skip those whose DC (l=0) coefficient is a
-  // small fraction of the volume's peak DC — those are empty background. Coeff 0 of
-  // a voxel is *voxelCoeffs(i,j,k) (the coeff-outermost layout puts c=0 first).
-  float maxDc = 0.0f;
-  for (int k = 0; k < nz; ++k)
-    for (int j = 0; j < ny; ++j)
-      for (int i = 0; i < nx; ++i) maxDc = std::max(maxDc, *vol.voxelCoeffs(i, j, k));
-  const float dcThresh = 0.1f * maxDc;  // 10% of peak DC ~ a coarse brain mask
-
-  std::vector<VoxelIndex> cand;
-  for (int k = 0; k < nz; ++k)
-    for (int j = 0; j < ny; ++j)
-      for (int i = 0; i < nx; ++i)
-        if (*vol.voxelCoeffs(i, j, k) > dcThresh) cand.push_back({i, j, k});
-
-  // Budget: ~3000 glyphs keeps the mesh well under ~20 MB at subdiv 2/3.
-  constexpr std::size_t kGlyphBudget = 3000;
-  std::vector<VoxelIndex> chosen;
-  if (cand.size() <= kGlyphBudget) {
-    chosen = std::move(cand);  // small volume (e.g. the demo): every glyph
-  } else {
-    // Too many to draw all: one axial slice (the scrub focus, or the centre), strided
-    // within if even that is over budget. An empty slice -> empty scene (the caller
-    // just clears the glyphs while scrubbing past empty slices).
-    scene.sliced = true;
-    const int k0 = (sliceK >= 0 && sliceK < nz) ? sliceK : nz / 2;
-    for (const VoxelIndex& v : cand)
-      if (v.k == k0) chosen.push_back(v);
-    if (chosen.size() > kGlyphBudget) {
-      const std::size_t stride = (chosen.size() + kGlyphBudget - 1) / kGlyphBudget;
-      std::vector<VoxelIndex> strided;
-      for (std::size_t i = 0; i < chosen.size(); i += stride) strided.push_back(chosen[i]);
-      chosen = std::move(strided);
-    }
-  }
-  if (chosen.empty()) return scene;
-
-  // Smoother spheres only when there are few glyphs (cost scales with verts*coeffs).
-  const int subdiv = (chosen.size() <= 512) ? 3 : 2;
-  const auto& [ico, B] = CachedGlyphBasis(subdiv, vol.nCoeffs);  // rebuilt only on (subdiv,nCoeffs) change
-
-  // Glyph radius ~ half a voxel so neighbours don't overlap (voxel size = the
-  // shortest affine column length, matching the ODF render prototype).
-  auto colLen = [&](int c) {
-    return std::sqrt(vol.affine.at(0, c) * vol.affine.at(0, c) +
-                     vol.affine.at(1, c) * vol.affine.at(1, c) +
-                     vol.affine.at(2, c) * vol.affine.at(2, c));
-  };
-  const float voxSize = std::min({colLen(0), colLen(1), colLen(2)});
-
-  GlyphParams gp;
-  gp.scale = 0.45f * voxSize;
-  gp.normalizePerGlyph = true;
-  gp.clampNegative = true;
-  const GlyphMesh mesh = BuildGlyphs(vol, ico, B, chosen, gp);
-  FillSceneFromMesh(scene, mesh, chosen.size());
-  scene.lMax = B.order.lMax;
-  return scene;
-}
-
-// Discrete-sphere (SF) glyph scene: per-voxel AMPLITUDES on a fixed embedded sphere
-// (e.g. symmetric362), not SH. Always one axial slice (these are whole-brain). The
-// signal mask scans the target slice CACHE-FRIENDLY: a slice's voxels are a CONTIGUOUS
-// nx*ny run within each amplitude plane, so we accumulate the per-voxel max over the
-// sphere's planes as sequential slabs (prefetcher-fast) — not a strided per-voxel gather.
-OdfGlyphScene BuildDiscreteOdfScene(const tracto::odf::OdfVolume& vol, int sliceK = -1) {
-  using namespace tracto::odf;
-  OdfGlyphScene scene;
-  const Icosphere* sphere = DiscreteSphereForCount(vol.nCoeffs);
-  if (vol.empty() || sphere == nullptr) return scene;
-  scene.sliced = true;
-
-  const int nx = vol.dims[0], ny = vol.dims[1], nz = vol.dims[2];
-  const std::size_t spatial = vol.voxelCount();
-  const std::size_t plane = static_cast<std::size_t>(nx) * ny;
-  const int k0 = (sliceK >= 0 && sliceK < nz) ? sliceK : nz / 2;
-
-  // Per-voxel max amplitude on slice k0, plane-by-plane over contiguous slabs.
-  std::vector<float> sliceMax(plane, 0.0f);
-  const float* base = vol.coeffs.data();
-  const std::size_t sliceBase = static_cast<std::size_t>(k0) * plane;
-  for (int v = 0; v < vol.nCoeffs; ++v) {
-    const float* ampPlane = base + static_cast<std::size_t>(v) * spatial + sliceBase;  // nx*ny contiguous
-    for (std::size_t p = 0; p < plane; ++p) sliceMax[p] = std::max(sliceMax[p], ampPlane[p]);
-  }
-  const float thresh = 0.1f * vol.valueMax;  // coarse mask vs the volume's global max amplitude
-
-  std::vector<VoxelIndex> cand;
-  for (std::size_t p = 0; p < plane; ++p)
-    if (sliceMax[p] > thresh)
-      cand.push_back({static_cast<int>(p % nx), static_cast<int>(p / nx), k0});
-
-  // Budget (each glyph = 362 verts / 720 tris): stride within the slice if over.
-  constexpr std::size_t kGlyphBudget = 3000;
-  std::vector<VoxelIndex> chosen;
-  if (cand.size() <= kGlyphBudget) {
-    chosen = std::move(cand);
-  } else {
-    const std::size_t stride = (cand.size() + kGlyphBudget - 1) / kGlyphBudget;
-    for (std::size_t i = 0; i < cand.size(); i += stride) chosen.push_back(cand[i]);
-  }
-  if (chosen.empty()) return scene;
-
-  auto colLen = [&](int c) {
-    return std::sqrt(vol.affine.at(0, c) * vol.affine.at(0, c) +
-                     vol.affine.at(1, c) * vol.affine.at(1, c) +
-                     vol.affine.at(2, c) * vol.affine.at(2, c));
-  };
-  GlyphParams gp;
-  gp.scale = 0.45f * std::min({colLen(0), colLen(1), colLen(2)});
-  gp.normalizePerGlyph = true;
-  gp.clampNegative = true;
-  FillSceneFromMesh(scene, BuildGlyphsSF(vol, *sphere, chosen, gp), chosen.size());
-  scene.lMax = 0;  // not applicable to a discrete-sphere ODF
-  return scene;
-}
-
-// A drawable peaks scene: interleaved [pos.xyz, rgb] line segments (2 verts each)
-// + the world (RAS) bounds + metadata for the status line. Same vertex layout as the
-// streamlines, so the viewport draws it with the existing line pipeline.
-struct PeaksScene {
-  std::vector<float> vertices;  // 6 floats/vertex; 2 verts (12 floats) per segment
-  Bounds bounds{};
-  std::size_t segmentCount = 0;
-  int nPeaks = 0;
-  bool sliced = false;          // true when only one axial slice is drawn -> follows scrub
-};
-
-// Build DEC-coloured peak line segments from a 4-D peaks NIfTI (loaded via the ODF
-// loader: coeff-outermost, nCoeffs = 3·nPeaks, so peak p of a voxel is the triplet
-// at coeff indices 3p,3p+1,3p+2). Each present peak becomes one bidirectional segment
-// through the voxel centre, length ∝ its magnitude, coloured by |unit direction|.
-//
-// EFFICIENCY (the user's hard requirement):
-//  * The per-voxel signal mask scans only |peak0|, indexed by FLAT voxel v over the
-//    three CONTIGUOUS component planes (coeffs[v], coeffs[spatial+v], coeffs[2·spatial+v])
-//    — three sequential streams the prefetcher loves, NOT a strided (i,j,k) gather.
-//  * Bounded like the glyphs: above a segment budget, central axial slice, then stride,
-//    so a whole-brain field (millions of voxels) never explodes the vertex buffer.
-//  * The only strided reads are the final gather over the BOUNDED chosen subset.
-//  * `sliceK` (>=0) follows the scrub focus; <0 uses the central axial slice.
-PeaksScene BuildPeaksScene(const tracto::odf::OdfVolume& vol, int sliceK = -1) {
-  using namespace tracto::odf;
-  PeaksScene scene;
-  const int nPeaks = vol.nCoeffs / 3;
-  if (vol.empty() || nPeaks <= 0) return scene;
-  scene.nPeaks = nPeaks;
-
-  const int nx = vol.dims[0], ny = vol.dims[1], nz = vol.dims[2];
-  const std::size_t spatial = vol.voxelCount();
-  const float* d = vol.coeffs.data();  // component (3p+c) plane starts at (3p+c)*spatial
-
-  // |peak0| per voxel = the signal gauge (the first/strongest direction). Two
-  // sequential passes over the three component planes: max, then threshold.
-  auto mag0 = [&](std::size_t v) {
-    const float x = d[v], y = d[spatial + v], z = d[2 * spatial + v];
-    return std::sqrt(x * x + y * y + z * z);
-  };
-  float maxMag = 0.0f;
-  for (std::size_t v = 0; v < spatial; ++v) maxMag = std::max(maxMag, mag0(v));
-  if (maxMag <= 0.0f) return scene;
-  const float thresh = 0.1f * maxMag;  // coarse mask: 10% of the strongest peak
-
-  std::vector<std::size_t> cand;
-  for (std::size_t v = 0; v < spatial; ++v)
-    if (mag0(v) > thresh) cand.push_back(v);
-
-  // Budget the segments (each voxel emits up to nPeaks). Above it: central axial
-  // slice, then stride — the same bounding strategy as the ODF glyphs.
-  constexpr std::size_t kSegBudget = 60000;
-  const std::size_t budgetVox = std::max<std::size_t>(1, kSegBudget / static_cast<std::size_t>(nPeaks));
-  std::vector<std::size_t> chosen;
-  if (cand.size() <= budgetVox) {
-    chosen = std::move(cand);
-  } else {
-    scene.sliced = true;
-    const std::size_t plane = static_cast<std::size_t>(nx) * ny;
-    const int k0 = (sliceK >= 0 && sliceK < nz) ? sliceK : nz / 2;
-    for (std::size_t v : cand)
-      if (static_cast<int>(v / plane) == k0) chosen.push_back(v);
-    if (chosen.size() > budgetVox) {
-      const std::size_t stride = (chosen.size() + budgetVox - 1) / budgetVox;
-      std::vector<std::size_t> strided;
-      for (std::size_t i = 0; i < chosen.size(); i += stride) strided.push_back(chosen[i]);
-      chosen = std::move(strided);
-    }
-  }
-  if (chosen.empty()) return scene;
-
-  // Half-length: half a voxel for the strongest peak, scaled by each peak's magnitude
-  // so weaker peaks read shorter. voxSize = shortest affine column (matches the glyphs).
-  auto colLen = [&](int c) {
-    return std::sqrt(vol.affine.at(0, c) * vol.affine.at(0, c) +
-                     vol.affine.at(1, c) * vol.affine.at(1, c) +
-                     vol.affine.at(2, c) * vol.affine.at(2, c));
-  };
-  const float halfMax = 0.5f * std::min({colLen(0), colLen(1), colLen(2)});
-
-  scene.vertices.reserve(chosen.size() * static_cast<std::size_t>(nPeaks) * 12);
-  for (std::size_t v : chosen) {
-    const int i = static_cast<int>(v % nx);
-    const int j = static_cast<int>((v / nx) % ny);
-    const int k = static_cast<int>(v / (static_cast<std::size_t>(nx) * ny));
-    const auto ctr = VoxelToWorld(vol.affine, VoxelIndex{i, j, k});  // segment centre (world mm)
-    for (int p = 0; p < nPeaks; ++p) {
-      const float x = d[(3 * p + 0) * spatial + v];
-      const float y = d[(3 * p + 1) * spatial + v];
-      const float z = d[(3 * p + 2) * spatial + v];
-      const float mag = std::sqrt(x * x + y * y + z * z);
-      if (mag <= thresh) continue;  // absent / negligible peak
-      const float inv = 1.0f / mag;
-      const float ux = x * inv, uy = y * inv, uz = z * inv;
-      const float h = halfMax * std::min(1.0f, mag / maxMag);  // length ∝ strength
-      const float r = std::abs(ux), g = std::abs(uy), b = std::abs(uz);  // DEC colour
-      scene.vertices.insert(scene.vertices.end(),  // bidirectional (peaks are antipodal)
-                            {ctr.x - ux * h, ctr.y - uy * h, ctr.z - uz * h, r, g, b,
-                             ctr.x + ux * h, ctr.y + uy * h, ctr.z + uz * h, r, g, b});
-      ++scene.segmentCount;
-    }
-  }
-  if (scene.vertices.empty()) return scene;
-
-  // Tight bounds from the actual segment endpoints (like the glyph scene).
-  float lo[3] = {scene.vertices[0], scene.vertices[1], scene.vertices[2]};
-  float hi[3] = {lo[0], lo[1], lo[2]};
-  for (std::size_t o = 0; o < scene.vertices.size(); o += 6) {
-    lo[0] = std::min(lo[0], scene.vertices[o + 0]); hi[0] = std::max(hi[0], scene.vertices[o + 0]);
-    lo[1] = std::min(lo[1], scene.vertices[o + 1]); hi[1] = std::max(hi[1], scene.vertices[o + 1]);
-    lo[2] = std::min(lo[2], scene.vertices[o + 2]); hi[2] = std::max(hi[2], scene.vertices[o + 2]);
-  }
-  scene.bounds.v[0] = lo[0]; scene.bounds.v[1] = hi[0];
-  scene.bounds.v[2] = lo[1]; scene.bounds.v[3] = hi[1];
-  scene.bounds.v[4] = lo[2]; scene.bounds.v[5] = hi[2];
-  return scene;
-}
-
-// True only for the canonical even-symmetric SH counts real fODF data uses
-// (6,15,28,45,66,...). InferShOrder also admits degenerate odd-symmetric solutions
-// (e.g. nCoeffs=3 -> "lMax=1"), which are actually small peaks fields, not ODFs —
-// exclude those so the router never glyphs a peaks file.
-bool IsEvenSymmetricShCount(int t) {
-  if (t < 6) return false;  // lMax>=2; nCoeffs=1 (lMax 0) is a scalar, not a glyph ODF
-  try {
-    const tracto::odf::ShOrder o = tracto::odf::InferShOrder(static_cast<std::size_t>(t));
-    return o.kind == tracto::odf::ShBasisKind::Symmetric && o.lMax >= 2 && (o.lMax % 2 == 0);
-  } catch (...) {
-    return false;
-  }
-}
-
-// Content sanity check separating a real symmetric-SH fODF from a peaks / vector
-// field that happens to share a coefficient count (e.g. 15 = lMax-4 SH = 5 peaks,
-// 6 = lMax-2 SH = 2 peaks). The headers carry no intent metadata to tell them
-// apart, but a real fODF has a POSITIVE l=0 (DC) coefficient — the isotropic mean —
-// in every voxel with signal, whereas a stacked vector field's "coeff 0" is a
-// signed component (positive ~half the time). So: overwhelmingly-positive DC ⇒ fODF.
-bool LooksLikeFodf(const tracto::odf::OdfVolume& vol) {
-  const int nx = vol.dims[0], ny = vol.dims[1], nz = vol.dims[2];
-  const float thr = 0.05f * std::max(std::abs(vol.valueMin), std::abs(vol.valueMax));
-  std::size_t signal = 0, positive = 0;
-  for (int k = 0; k < nz; ++k)
-    for (int j = 0; j < ny; ++j)
-      for (int i = 0; i < nx; ++i) {
-        const float dc = *vol.voxelCoeffs(i, j, k);  // coeff 0 of this voxel
-        if (std::abs(dc) > thr) {
-          ++signal;
-          if (dc > 0.0f) ++positive;
-        }
-      }
-  return signal != 0 && static_cast<double>(positive) / static_cast<double>(signal) >= 0.9;
-}
-
-// Voxel k (axial slice index) whose plane is nearest a world-Z. Assumes an
-// axis-aligned affine (world-z depends only on k), true for typical RAS data; for a
-// rotated affine this is an approximation. Clamped into [0, nz-1].
-int AxialSliceIndex(const tracto::odf::OdfVolume& vol, float worldZ) {
-  const float a = vol.affine.at(2, 2);  // world-z per voxel-k step
-  const float b = vol.affine.at(2, 3);  // world-z at k=0
-  if (std::abs(a) < 1e-6f) return vol.dims[2] / 2;
-  const int k = static_cast<int>(std::lround((worldZ - b) / a));
-  return std::clamp(k, 0, vol.dims[2] - 1);
+// The tracto_odf scene builders report their world bounds as the module's own
+// AABB (they stay cpp/core-free); the viewport speaks cpp/core Bounds. Convert at
+// this Qt boundary.
+Bounds ToBounds(const odf::AABB& a) {
+  Bounds b;
+  b.v[0] = a.min.x; b.v[1] = a.max.x;
+  b.v[2] = a.min.y; b.v[3] = a.max.y;
+  b.v[4] = a.min.z; b.v[5] = a.max.z;
+  return b;
 }
 
 }  // namespace
@@ -772,7 +424,10 @@ void MainWindow::ActivateTracts(int index) {
   args_.trkPath = nb.path.toStdString();
   hasTracts_ = !store_.x.empty();
   activeTracts_ = index;
-  selection_->Build(store_);  // rebuild the grid index for the now-active tractogram
+  selection_->Build(store_, &tractRasBounds_);  // rebuild the grid index; reuse cached AABB
+  if (!store_.x.empty() && !selection_->IndexBuilt())  // cap tripped -> queries go serial
+    std::printf("note: selection grid disabled (coordinate range too large); "
+                "box queries will use the linear scan\n");
   RebuildDisplay();
   RebuildTractOverlays();  // the previously-active bundle (if visible) is now an overlay
   RebuildDensityMap();     // density map follows the active bundle
@@ -837,10 +492,14 @@ void MainWindow::LoadVolumeLayer(const QString& path, bool isLabel) {
     else
       ComputeHistogram(layer);  // grayscale window: histBins + adaptive [dispMin,dispMax]
     if (isLabel) ComputeLabelLut(layer);  // per-label colour table for label-mode rendering
-    volumes_.push_back(std::move(layer));  // keep our copy (data + histogram + window)
+    volumes_.push_back(std::move(layer));  // keep our layer (histogram + window + metadata)
     selectedVolumeId_ = id;
-    const VolumeLayer& added = volumes_.back();
-    viewport_->SetImage(id, added.vol, added.isLabel, added.lut, added.lutWidth);
+    VolumeLayer& added = volumes_.back();
+    // Hand the voxel grid to the viewport, which retains the authoritative copy
+    // for RHI re-upload. Moving empties only added.vol.data; the dims/valueMin/
+    // valueMax UpdateInfo needs survive the move, and the histogram/LUT that read
+    // .data were already computed above — so no reader sees the emptied buffer.
+    viewport_->SetImage(id, std::move(added.vol), added.isLabel, added.lut, added.lutWidth);
     viewport_->SetImageParams(id, added.winLo, added.winHi, added.opacity);
     if (isStat) {
       viewport_->SetImageStatmap(id, true);    // diverging hot/cool ramp + |stat| threshold
@@ -920,7 +579,7 @@ void MainWindow::DetectAndLoad(const QString& path) {
   const int t = info.ndim >= 4 ? info.dim[4] : 1;  // length of the 4th axis
   if (t <= 1) { LoadVolume(path); return; }        // 3-D scalar background
 
-  if (IsEvenSymmetricShCount(t)) { LoadOdf(path); return; }  // SH ODF (LoadOdf re-checks vs peaks)
+  if (odf::IsEvenSymmetricShCount(t)) { LoadOdf(path); return; }  // SH ODF (LoadOdf re-checks vs peaks)
   if (t % 3 == 0) { LoadPeaks(path); return; }               // Nx3 peaks field
   // A 4-D image that is neither SH-ODF nor peaks. A large 4th axis (362, 642, 724, …)
   // is a DISCRETE-SPHERE ODF: per-voxel amplitudes sampled on a fixed sphere whose
@@ -952,7 +611,7 @@ void MainWindow::LoadOdf(const QString& path) {
     // Confirm it's really an fODF and not a peaks/vector field sharing the same
     // coefficient count (the header can't tell them apart — content can). If it's a
     // peaks field, draw it as peaks from THIS already-loaded volume (no second read).
-    if (!LooksLikeFodf(vol)) {
+    if (!odf::LooksLikeFodf(vol)) {
       if (vol.nCoeffs % 3 == 0) {
         std::printf("4-D image (%d coeffs) is a peaks/vector field, not an fODF — "
                     "drawing as peaks\n", vol.nCoeffs);
@@ -967,7 +626,7 @@ void MainWindow::LoadOdf(const QString& path) {
       return;
     }
     const auto t0 = std::chrono::steady_clock::now();
-    OdfGlyphScene scene = BuildOdfGlyphScene(vol);
+    odf::OdfGlyphScene scene = odf::BuildOdfGlyphScene(vol);
     const double buildMs =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (scene.glyphCount == 0 || scene.indices.empty()) {
@@ -982,7 +641,7 @@ void MainWindow::LoadOdf(const QString& path) {
     args_.volumePath = path.toStdString();
     const std::size_t glyphs = scene.glyphCount;
     const int lmax = scene.lMax;
-    viewport_->SetGlyphGeometry(std::move(scene.vertices), std::move(scene.indices), scene.bounds);
+    viewport_->SetGlyphGeometry(std::move(scene.vertices), std::move(scene.indices), ToBounds(scene.bounds));
     viewport_->SetGlyphsVisible(true);
     // One ODF layer at a time: a new load replaces the old Layers row (+ checkbox).
     if (layers_) {
@@ -1013,7 +672,7 @@ void MainWindow::LoadDiscreteOdf(const QString& path) {
   // only the mesh builder differs (BuildGlyphsSF, no SH basis).
   try {
     tracto::odf::OdfVolume vol = tracto::odf::LoadOdfNifti(path.toStdString());
-    OdfGlyphScene scene = BuildDiscreteOdfScene(vol);
+    odf::OdfGlyphScene scene = odf::BuildDiscreteOdfScene(vol);
     if (scene.glyphCount == 0 || scene.indices.empty()) {
       ReportError("ODF load failed",
                   "No glyphs to draw (the volume looks empty after thresholding):\n" + path);
@@ -1026,7 +685,7 @@ void MainWindow::LoadDiscreteOdf(const QString& path) {
     args_.volumePath = path.toStdString();
     const std::size_t glyphs = scene.glyphCount;
     const int ndir = vol.nCoeffs;
-    viewport_->SetGlyphGeometry(std::move(scene.vertices), std::move(scene.indices), scene.bounds);
+    viewport_->SetGlyphGeometry(std::move(scene.vertices), std::move(scene.indices), ToBounds(scene.bounds));
     viewport_->SetGlyphsVisible(true);
     if (layers_) {
       if (odfLayerId_ >= 0) layers_->RemoveLayer(odfLayerId_);
@@ -1053,7 +712,7 @@ bool MainWindow::DisplayPeaks(const odf::OdfVolume& vol, const QString& path) {
   // files) and LoadOdf's not-fODF fallback (ambiguous SH-count files that are really
   // peaks) — so an ambiguous peaks file is read from disk exactly once. Returns whether
   // the scene is a single slice (the caller then keeps the volume resident to scrub).
-  PeaksScene scene = BuildPeaksScene(vol);  // central slice on first show; scrub follows
+  odf::PeaksScene scene = odf::BuildPeaksScene(vol);  // central slice on first show; scrub follows
   if (scene.segmentCount == 0 || scene.vertices.empty()) {
     ReportError("Peaks load failed",
                 "No peak directions to draw (the field looks empty):\n" + path);
@@ -1066,7 +725,7 @@ bool MainWindow::DisplayPeaks(const odf::OdfVolume& vol, const QString& path) {
   args_.volumePath = path.toStdString();
   const std::size_t segs = scene.segmentCount;
   const int np = scene.nPeaks;
-  viewport_->SetPeaksGeometry(std::move(scene.vertices), scene.bounds);
+  viewport_->SetPeaksGeometry(std::move(scene.vertices), ToBounds(scene.bounds));
   viewport_->SetPeaksVisible(true);
   // One peaks layer at a time: a new load replaces the old Layers row (+ checkbox).
   if (layers_) {
@@ -1101,14 +760,14 @@ void MainWindow::RebuildSliceGlyphs() {
   if (!viewport_ || (!odfVol_ && !peaksVol_)) return;
   const float z = viewport_->SliceFocus().z;
   if (odfVol_) {
-    const int k = AxialSliceIndex(*odfVol_, z);
-    OdfGlyphScene s = odfIsDiscrete_ ? BuildDiscreteOdfScene(*odfVol_, k)
-                                     : BuildOdfGlyphScene(*odfVol_, k);
-    viewport_->SetGlyphGeometry(std::move(s.vertices), std::move(s.indices), s.bounds);
+    const int k = odf::AxialSliceIndex(*odfVol_, z);
+    odf::OdfGlyphScene s = odfIsDiscrete_ ? odf::BuildDiscreteOdfScene(*odfVol_, k)
+                                          : odf::BuildOdfGlyphScene(*odfVol_, k);
+    viewport_->SetGlyphGeometry(std::move(s.vertices), std::move(s.indices), ToBounds(s.bounds));
   }
   if (peaksVol_) {
-    PeaksScene s = BuildPeaksScene(*peaksVol_, AxialSliceIndex(*peaksVol_, z));
-    viewport_->SetPeaksGeometry(std::move(s.vertices), s.bounds);
+    odf::PeaksScene s = odf::BuildPeaksScene(*peaksVol_, odf::AxialSliceIndex(*peaksVol_, z));
+    viewport_->SetPeaksGeometry(std::move(s.vertices), ToBounds(s.bounds));
   }
 }
 
@@ -1290,8 +949,9 @@ void MainWindow::UpdateEmptyHint() {
 
 QString MainWindow::SamplePath() const {
   // Bundled demo fODF, resolved against likely roots (run-from-repo, or next to the
-  // binary). Empty if absent -> the "Load sample" affordance simply hides.
-  const QString rel = "dmri-explorer/data/odf.nii.gz";
+  // binary). Empty if absent -> the "Load sample" affordance simply hides. Drop a
+  // sample at data/odf.nii.gz (gitignored) to enable the one-click loader.
+  const QString rel = "data/odf.nii.gz";
   const QString appDir = QCoreApplication::applicationDirPath();
   for (const QString& root : {QDir::currentPath(), appDir, appDir + "/..", appDir + "/../.."}) {
     const QString p = QDir(root).filePath(rel);
@@ -1303,7 +963,7 @@ QString MainWindow::SamplePath() const {
 void MainWindow::LoadSample() {
   const QString p = SamplePath();
   if (p.isEmpty())
-    ReportError("Sample not found", "Couldn't find the bundled demo dmri-explorer/data/odf.nii.gz.");
+    ReportError("Sample not found", "Couldn't find the demo fODF at data/odf.nii.gz.");
   else
     DetectAndLoad(p);
 }
@@ -1441,135 +1101,28 @@ void MainWindow::UpdateInfo() {
   properties_->SetInfo(s.isEmpty() ? QStringLiteral("No data loaded.") : s.trimmed());
 }
 
+// Thin adapters over the UI-free numeric compute in cpp/core/statistics: run the
+// core routine on the layer's Volume, then copy the result into the per-layer
+// display state MainWindow owns. The percentile / intent-threshold / LUT policy
+// lives in core (and is covered by core_selftest), not here.
 void MainWindow::ComputeHistogram(VolumeLayer& vl) {
-  // Adaptive intensity axis: a few bright outliers shouldn't squash the bulk of
-  // the data to the left, so cap the displayed max at the 99.5th percentile. The
-  // default window uses that same robust range (FSLeyes-style auto contrast).
-  const Volume& v = vl.vol;
-  const float dmin = v.valueMin;
-  const float dmax = (v.valueMax > v.valueMin) ? v.valueMax : v.valueMin + 1.0f;
-  constexpr int kFine = 1024;
-  std::vector<double> fine(kFine, 0.0);
-  const double finv = static_cast<double>(kFine - 1) / (static_cast<double>(dmax) - dmin);
-  for (float s : v.data) fine[std::clamp(static_cast<int>((static_cast<double>(s) - dmin) * finv),
-                                         0, kFine - 1)] += 1.0;
-  const double total = std::max(1.0, static_cast<double>(v.data.size()));
-  double cum = 0.0;
-  int robBin = kFine - 1;
-  for (int i = 0; i < kFine; ++i) { cum += fine[i]; if (cum >= 0.995 * total) { robBin = i; break; } }
-
-  vl.dispMin = dmin;
-  vl.dispMax = dmin + static_cast<float>(robBin + 1) / kFine * (dmax - dmin);
-  if (vl.dispMax <= vl.dispMin) vl.dispMax = dmax;
-  vl.winLo = vl.dispMin;
-  vl.winHi = vl.dispMax;
-
-  // 160 display bins over [dispMin, dispMax], aggregated from the fine bins.
-  constexpr int kDisp = 160;
-  vl.histBins.assign(kDisp, 0.0f);
-  const float span = std::max(1e-9f, vl.dispMax - vl.dispMin);
-  for (int j = 0; j < kFine; ++j) {
-    const double cj = dmin + (j + 0.5) / kFine * (static_cast<double>(dmax) - dmin);
-    const int db = std::clamp(static_cast<int>((cj - vl.dispMin) / span * kDisp), 0, kDisp - 1);
-    vl.histBins[db] += static_cast<float>(fine[j]);
-  }
+  VolumeHistogram h = ComputeVolumeHistogram(vl.vol);
+  vl.dispMin = h.dispMin; vl.dispMax = h.dispMax;
+  vl.winLo = h.winLo; vl.winHi = h.winHi;
+  vl.histBins = std::move(h.bins);
 }
 
 void MainWindow::ComputeStatHistogram(VolumeLayer& vl, int intentCode) {
-  // An fMRI stat map (z/t/r/…) is SIGNED and symmetric about 0, so the meaningful
-  // axis is |stat|, not the raw min/max grayscale window (which a single outlier
-  // would wreck). Build a |stat| histogram over the non-zero voxels (the map is
-  // mostly exact-0 background) and seed a [threshold, cap] window that is data-aware
-  // and editable: cap from a robust high percentile so a few hot peaks don't squash
-  // the scale; threshold by statistic kind (z/t≈2.3, r≈0.3 — FSL/SPM conventions),
-  // else a robust percentile so low-magnitude noise starts hidden.
-  const Volume& v = vl.vol;  // data is finite — LoadNifti sanitizes NaN/Inf to 0 at load
-  float absMax = 0.0f;
-  for (float s : v.data) absMax = std::max(absMax, std::abs(s));
-  if (absMax <= 0.0f) absMax = 1.0f;
-
-  constexpr int kFine = 1024;
-  std::vector<double> fine(kFine, 0.0);
-  const double finv = static_cast<double>(kFine - 1) / absMax;
-  double nz = 0.0;  // count of non-zero voxels (background excluded from percentiles)
-  for (float s : v.data) {
-    const float a = std::abs(s);
-    if (a <= 0.0f) continue;
-    fine[std::clamp(static_cast<int>(a * finv), 0, kFine - 1)] += 1.0;
-    nz += 1.0;
-  }
-  if (nz <= 0.0) nz = 1.0;
-  auto percentile = [&](double frac) {
-    double cum = 0.0;
-    for (int i = 0; i < kFine; ++i) {
-      cum += fine[i];
-      if (cum >= frac * nz) return static_cast<float>((i + 1) / static_cast<double>(kFine) * absMax);
-    }
-    return absMax;
-  };
-
-  const float cap = percentile(0.98);                          // default high handle
-  const float axisMax = std::max(cap, percentile(0.999));      // histogram axis (headroom over cap)
-  float thr;
-  switch (intentCode) {
-    case 5: case 3: thr = 2.3f; break;            // ZSCORE / TTEST (FSL cluster-forming default)
-    case 2:         thr = 0.3f; break;            // CORREL (Pearson r)
-    default:        thr = percentile(0.80); break;  // unknown signed map: hide the low-magnitude bulk
-  }
-  thr = std::clamp(thr, 0.0f, 0.9f * cap);        // keep threshold below the cap (winLo < winHi)
-
-  vl.dispMin = 0.0f;
-  vl.dispMax = axisMax;
-  vl.winLo = thr;   // |stat| threshold (low handle)
-  vl.winHi = cap;   // |stat| cap       (high handle)
-
-  // 160 display bins over [0, axisMax], aggregated from the fine |stat| bins.
-  constexpr int kDisp = 160;
-  vl.histBins.assign(kDisp, 0.0f);
-  for (int j = 0; j < kFine; ++j) {
-    const double cj = (j + 0.5) / kFine * absMax;
-    const int db = std::clamp(static_cast<int>(cj / axisMax * kDisp), 0, kDisp - 1);
-    vl.histBins[db] += static_cast<float>(fine[j]);
-  }
+  VolumeHistogram h = tracto::ComputeStatHistogram(vl.vol, intentCode);
+  vl.dispMin = h.dispMin; vl.dispMax = h.dispMax;
+  vl.winLo = h.winLo; vl.winHi = h.winHi;
+  vl.histBins = std::move(h.bins);
 }
 
 void MainWindow::ComputeLabelLut(VolumeLayer& vl) {
-  // Build a dense RGBA table indexed by integer label value (the shader does
-  // texelFetch(uLut, idx)). Index 0 is background → transparent; each non-zero
-  // label gets a distinct hue from the golden-ratio walk (maximally spread,
-  // stable per index). Width = maxLabel+1, capped so a stray huge value can't
-  // allocate an absurd texture (the shader clamps out-of-range indices).
-  constexpr int kMaxLut = 4096;  // covers FreeSurfer aseg (~2035) and atlases
-  int maxLabel = 0;
-  for (float s : vl.vol.data) {
-    const int idx = static_cast<int>(s + 0.5f);
-    if (idx > maxLabel) maxLabel = idx;
-  }
-  const int width = std::clamp(maxLabel + 1, 2, kMaxLut);
-  vl.lut.assign(static_cast<std::size_t>(width) * 4, 0.0f);  // index 0 stays (0,0,0,0)
-
-  auto hsvToRgb = [](float h, float s, float v, float& r, float& g, float& b) {
-    const float i = std::floor(h * 6.0f);
-    const float f = h * 6.0f - i;
-    const float p = v * (1.0f - s), q = v * (1.0f - f * s), t = v * (1.0f - (1.0f - f) * s);
-    switch (static_cast<int>(i) % 6) {
-      case 0: r = v; g = t; b = p; break;
-      case 1: r = q; g = v; b = p; break;
-      case 2: r = p; g = v; b = t; break;
-      case 3: r = p; g = q; b = v; break;
-      case 4: r = t; g = p; b = v; break;
-      default: r = v; g = p; b = q; break;
-    }
-  };
-  constexpr float kGolden = 0.61803398875f;
-  for (int idx = 1; idx < width; ++idx) {
-    const float hue = std::fmod(static_cast<float>(idx) * kGolden, 1.0f);
-    float r, g, b;
-    hsvToRgb(hue, 0.65f, 0.95f, r, g, b);
-    float* px = &vl.lut[static_cast<std::size_t>(idx) * 4];
-    px[0] = r; px[1] = g; px[2] = b; px[3] = 1.0f;
-  }
-  vl.lutWidth = width;
+  LabelLut l = tracto::ComputeLabelLut(vl.vol);
+  vl.lutWidth = l.width;
+  vl.lut = std::move(l.rgba);
 }
 
 void MainWindow::UpdateHistogram() {
@@ -1599,7 +1152,18 @@ void MainWindow::RefreshStats() {
     properties_->SetStats("Load a tractogram first.");
     return;
   }
-  const BasicStats s = ComputeBasicStats(store_, aliveFull_);
+  BasicStats s = ComputeBasicStats(store_, aliveFull_);
+
+  // "Volume on tract" (Python reference parity): sample the selected scalar volume
+  // along the surviving tracts. The viewport owns the voxel grid (SetImage moved it
+  // in), so borrow it read-only. Labels are integer maps → skipped.
+  for (const VolumeLayer& vl : volumes_) {
+    if (vl.id != selectedVolumeId_ || vl.isLabel) continue;
+    if (const Volume* vol = viewport_ ? viewport_->ImageVolume(vl.id) : nullptr)
+      s.volumeOnTract = SampleVolumeAlongTracts(store_, *vol, aliveFull_);
+    break;
+  }
+
   auto summary = [](const NumericSummary& n) {
     return n.valid ? QStringLiteral("%1 ± %2  [%3, %4]")
                          .arg(n.mean, 0, 'f', 1)
@@ -1608,13 +1172,20 @@ void MainWindow::RefreshStats() {
                          .arg(n.max, 0, 'f', 1)
                    : QStringLiteral("—");
   };
-  properties_->SetStats(
+  QString text =
       QStringLiteral("kept    %1 / %2  (%3% deleted)\nlength  %4 mm\npts/ln  %5")
           .arg(QString::fromStdString(FormatCount(s.aliveCount)),
                QString::fromStdString(FormatCount(s.fullCount)))
           .arg(s.deletedPercent, 0, 'f', 1)
           .arg(summary(s.lengthMm))
-          .arg(summary(s.pointsPerLine)));
+          .arg(summary(s.pointsPerLine));
+  if (s.volumeOnTract.valid) {
+    const NumericSummary& n = s.volumeOnTract;  // 3 decimals: scalars like FA are in [0,1]
+    text += QStringLiteral("\nvolume  %1 ± %2  [%3, %4]")
+                .arg(n.mean, 0, 'f', 3).arg(n.stddev, 0, 'f', 3)
+                .arg(n.min, 0, 'f', 3).arg(n.max, 0, 'f', 3);
+  }
+  properties_->SetStats(text);
 }
 
 void MainWindow::PollSelectionReadout() {
@@ -1654,7 +1225,7 @@ std::size_t MainWindow::CountInBox(const std::vector<uint8_t>& inBox) const {
 }
 
 void MainWindow::PushHistory() {
-  constexpr std::size_t kMaxUndo = 50;
+  constexpr std::size_t kMaxUndo = 100;  // kept equal to Python's HISTORY_MAX (editor.py)
   history_.push_back(aliveFull_);
   if (history_.size() > kMaxUndo) history_.erase(history_.begin());
   tractsDirty_ = true;  // an edit is about to happen -> unsaved changes

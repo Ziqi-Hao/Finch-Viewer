@@ -19,8 +19,7 @@ struct TractogramStore {
   std::vector<float> y;
   std::vector<float> z;
   std::vector<int32_t> sid;
-  std::vector<int64_t> offsets;
-  std::vector<int64_t> pointCounts;
+  std::vector<int64_t> offsets;  // CSR: size n+1; points-per-line i = offsets[i+1]-offsets[i]
   std::vector<double> lengthsMm;
 
   std::size_t StreamlineCount() const { return streamlines.size(); }

@@ -40,6 +40,11 @@ class GridSelector:
     Query: for each (ix,iy) column overlapping the box, the wanted iz range is a
     *contiguous* bucket span, so its points are one slice of the sorted order;
     gather those candidates and test them exactly.
+
+    INVARIANT: the index is built ONCE over the full point cloud. Editing mutates
+    only the alive mask -- it never moves or removes points -- so the index stays
+    valid across edits and is deliberately NOT rebuilt on edit (the caller ANDs
+    query flags with the alive mask). Kept in lockstep with the C++ backend.
     """
 
     def __init__(self, tg, cell=3.0):
